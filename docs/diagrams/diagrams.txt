@@ -1,0 +1,5 @@
+architecture 1400 760
+write-path 1400 680
+read-path 1400 640
+recovery 1400 720
+sstable-format 1400 600
