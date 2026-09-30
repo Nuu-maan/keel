@@ -7,7 +7,7 @@ diagram(1400, 760, ({ box, arrow, text, note, title, C }) => {
 
   const leader = box(290, 130, 440, 500, { fill: C.purple });
   text(leader.cx, 162, "node 1 · leader", { size: 21 });
-  const wire = box(320, 195, 380, 72, { dashed: true, label: "wire protocol\nlength-prefixed frames over TCP", size: 16 });
+  const wire = box(320, 195, 380, 72, { label: "wire protocol\nlength-prefixed frames over TCP", size: 16 });
   box(320, 290, 380, 72, { dashed: true, label: "Raft\nelection · log replication · snapshots", size: 16 });
   const engine = box(320, 385, 380, 220, { fill: C.green });
   text(engine.cx, 412, "storage engine", { size: 19 });
@@ -21,7 +21,7 @@ diagram(1400, 760, ({ box, arrow, text, note, title, C }) => {
   const followers = [130, 400].map((y, i) => {
     const f = box(900, y, 300, 230, { fill: C.purple });
     text(f.cx, y + 30, `node ${i + 2} · follower`, { size: 19 });
-    box(925, y + 60, 250, 40, { dashed: true, label: "wire protocol", size: 15 });
+    box(925, y + 60, 250, 40, { label: "wire protocol", size: 15 });
     box(925, y + 110, 250, 40, { dashed: true, label: "Raft", size: 15 });
     box(925, y + 160, 250, 45, { fill: C.green, label: "storage engine", size: 15 });
     return f;

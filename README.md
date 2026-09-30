@@ -19,14 +19,27 @@ The goal is correctness under failure first, then performance. Every durability 
 | Full compaction | Done |
 | Leveled compaction | Planned ([#13](https://github.com/Nuu-maan/keel/issues/13)) |
 | Background flush and compaction | Planned ([#7](https://github.com/Nuu-maan/keel/issues/7)) |
-| TCP wire protocol | Planned |
+| TCP wire protocol, server, client, CLI | Done |
 | Raft replication | Planned |
 | Chaos testing with linearizability checking | Planned |
 | Metrics and benchmarks | Planned |
 
+## Quick start
+
+```
+go build ./cmd/keeld ./cmd/keelctl
+
+./keeld -addr 127.0.0.1:7070 -dir data &
+./keelctl put greeting "hello keel"
+./keelctl get greeting
+./keelctl del greeting
+```
+
+`keeld` shuts down cleanly on `SIGINT` or `SIGTERM`: it stops accepting connections, lets running requests finish, and then closes the store.
+
 ## Architecture
 
-The target design. The storage engine is built; the wire protocol and Raft come next.
+The target design. The storage engine and the network layer are built; Raft comes next.
 
 ![Keel architecture: clients talk to a Raft leader, which replicates to two followers; each node runs the LSM storage engine](docs/diagrams/architecture.png)
 
@@ -82,6 +95,23 @@ Any error during flush or compaction makes the store read-only. After a partiall
 **Reads.** `Get` checks the memtable first, then SSTables from newest to oldest, and stops at the first match. A tombstone means the key is deleted, even if an older table still holds a value. Each SSTable's bloom filter is checked before its index, so for a key the table doesn't contain, about 99% of lookups skip the disk read entirely.
 
 ![Read path: Get checks the memtable, then each SSTable newest first; a bloom filter rules most tables out before the block index and a single pread](docs/diagrams/read-path.png)
+
+## Network protocol
+
+![Wire protocol: request and response frames, and many pipelined requests on one connection feeding group commit](docs/diagrams/wire-protocol.png)
+
+```
+frame    : length (4, big-endian) | payload                 payload ≤ 16 MiB
+request  : op (1) | request id (8) | key len (uvarint) | key | value
+response : status (1) | request id (8) | value
+op       : 1 get · 2 put · 3 delete
+status   : 0 ok · 1 not found · 2 error (value holds the message)
+```
+
+- **Pipelining.** A client can have many requests in flight on one connection. The server runs each in its own goroutine, so requests from a single connection share group-commit batches. Responses go back in completion order, and the client matches them to callers by request ID.
+- **Backpressure.** Each connection allows at most 256 requests in flight. When that's reached, the server stops reading from the socket, TCP flow control fills the client's send buffer, and the client slows down instead of growing an unbounded queue on the server.
+- **Hostile input.** A length prefix over 16 MiB is rejected before anything is allocated. A malformed request or unknown op closes the connection, because with a broken frame there's no trustworthy request ID to answer.
+- **Deadlines.** A connection with no request for 5 minutes is closed. A response that can't be written within 10 seconds closes the connection. The client passes its `context` deadline down to the socket as a write deadline.
 
 ## On-disk format
 
@@ -145,6 +175,7 @@ Tests aim at failure modes, not just happy paths.
 - **Torn writes and corruption.** For the WAL: partial headers, partial payloads, zero-filled tails and a damaged last record are recovered. A damaged checksum, length or payload in the middle of the file is rejected. For SSTables: damaged blocks, filter, index, footer and magic number are all detected.
 - **Filter effectiveness.** A test fills an SSTable's data blocks with garbage but leaves the filter and index intact. Lookups for absent keys still succeed, because the filter stops them before any block is read. With the filter disabled, 1999 of 2000 of those lookups read a block.
 - **Batching.** A test holds the store lock while 64 writers queue up, then checks that they all reach disk in at most 4 WAL commits. Disabling the batching loop makes it fail with 64 commits.
+- **Network, end to end.** The tests run a real server on a loopback socket. They cover put, get and delete, and 500 concurrent calls pipelined over a single connection. They also check that the server closes the connection on an unknown op, an oversized length prefix or an idle timeout, and that clients fail cleanly when the server shuts down.
 - **Race detector.** CI runs the whole suite with `-race`.
 
 `SIGKILL` leaves the kernel page cache intact, so it doesn't simulate power loss. Power-loss testing is tracked in [#2](https://github.com/Nuu-maan/keel/issues/2).
@@ -156,6 +187,12 @@ go test -race ./...
 ## Layout
 
 ```
+cmd/
+  keeld/       server binary
+  keelctl/     command-line client
+wire/          frame and message encoding
+server/        TCP server: pipelining, backpressure, deadlines, shutdown
+client/        Go client: pipelined calls over one connection, context support
 storage/
   wal.go       write-ahead log: record format, append, replay, torn-tail recovery
   sstable.go   SSTable writer and reader: blocks, filter, index, footer
@@ -172,8 +209,7 @@ To change a diagram, edit its `.js` file and run `docs/diagrams/render.sh <name>
 ## Roadmap
 
 1. **Storage engine.** Leveled compaction ([#13](https://github.com/Nuu-maan/keel/issues/13)), background flush ([#7](https://github.com/Nuu-maan/keel/issues/7)).
-2. **Wire protocol.** Length-prefixed binary framing over TCP, with deadlines and backpressure.
-3. **Raft.** Leader election, log replication, snapshots, and linearizable reads through ReadIndex.
-4. **Chaos testing.** Process kills, `SIGSTOP`, network partitions with `iptables`, latency with `tc netem`. Recorded histories checked for linearizability with [Porcupine](https://github.com/anishathalye/porcupine).
-5. **Observability.** Prometheus metrics for latency histograms, `fsync` time, replication lag and elections.
-6. **Benchmarks.** Throughput and p50/p99/p99.9 latency under uniform and Zipfian workloads, compared with etcd.
+2. **Raft.** Leader election, log replication, snapshots, and linearizable reads through ReadIndex.
+3. **Chaos testing.** Process kills, `SIGSTOP`, network partitions with `iptables`, latency with `tc netem`. Recorded histories checked for linearizability with [Porcupine](https://github.com/anishathalye/porcupine).
+4. **Observability.** Prometheus metrics for latency histograms, `fsync` time, replication lag and elections.
+5. **Benchmarks.** Throughput and p50/p99/p99.9 latency under uniform and Zipfian workloads, compared with etcd.
