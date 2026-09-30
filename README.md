@@ -97,14 +97,11 @@ A flush error of any kind makes the store read-only. Once `N.sst` exists, the ol
 ### SSTable
 
 ```
-+-----------+-----------+-----+-------+-----------------------------------------------+
-|  block 0  |  block 1  | ... | index |                footer (24)                    |
-+-----------+-----------+-----+-------+-----------------------------------------------+
-                                       | index offset (8) | index len (4) | index crc32c (4) | magic (8) |
-
-block : entry* crc32c(4)                                      closed once it reaches ~4 KiB
-entry : key len (uvarint) | key | op (1) | value len (uvarint) | value
-index : per block: last key len (uvarint) | last key | offset (uvarint) | length (uvarint)
+file   : block* | index | footer
+block  : entry* | crc32c (4)                               closed at ~4 KiB
+entry  : key len (uvarint) | key | op (1) | value len (uvarint) | value
+index  : { last key len (uvarint) | last key | offset (uvarint) | length (uvarint) } per block
+footer : index offset (8) | index len (4) | index crc32c (4) | magic (8)
 ```
 
 - Entries are sorted by key and appear at most once per table.
