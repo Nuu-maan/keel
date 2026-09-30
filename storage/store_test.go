@@ -2,6 +2,7 @@ package storage
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"math/rand/v2"
 	"os"
@@ -27,11 +28,11 @@ func TestStoreSurvivesReopen(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.Close()
-	if v, ok := s.Get([]byte("k1")); !ok || string(v) != "v1b" {
-		t.Fatalf("k1 = %q, %v", v, ok)
+	if v, err := s.Get([]byte("k1")); err != nil || string(v) != "v1b" {
+		t.Fatalf("k1 = %q, %v", v, err)
 	}
-	if _, ok := s.Get([]byte("k2")); ok {
-		t.Fatal("k2 should be deleted")
+	if _, err := s.Get([]byte("k2")); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("k2: want ErrNotFound, got %v", err)
 	}
 }
 
@@ -67,8 +68,8 @@ func TestCrashRecovery(t *testing.T) {
 			t.Fatalf("round %d: reopen: %v", round, err)
 		}
 		for _, key := range acked {
-			if v, ok := s.Get([]byte(key)); !ok || string(v) != "v-"+key {
-				t.Fatalf("round %d: acknowledged write %q lost (got %q, %v)", round, key, v, ok)
+			if v, err := s.Get([]byte(key)); err != nil || string(v) != "v-"+key {
+				t.Fatalf("round %d: acknowledged write %q lost (got %q, %v)", round, key, v, err)
 			}
 		}
 		s.Close()
