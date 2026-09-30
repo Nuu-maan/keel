@@ -13,10 +13,14 @@ import (
 
 var ErrNotFound = errors.New("storage: key not found")
 
-const defaultMemtableSize = 4 << 20
+const (
+	defaultMemtableSize      = 4 << 20
+	defaultCompactionTrigger = 4
+)
 
 type Options struct {
-	MemtableSize int
+	MemtableSize      int
+	CompactionTrigger int
 }
 
 type Store struct {
@@ -33,12 +37,12 @@ type Store struct {
 	err     error
 }
 
-// Files share one increasing number sequence. Flush writes SSTable N and only then
-// opens WAL N+1, so on recovery any WAL numbered below the newest SSTable is already
-// flushed and must be deleted, not replayed: replaying it would resurrect stale values.
 func Open(dir string, opts Options) (*Store, error) {
 	if opts.MemtableSize <= 0 {
 		opts.MemtableSize = defaultMemtableSize
+	}
+	if opts.CompactionTrigger <= 1 {
+		opts.CompactionTrigger = defaultCompactionTrigger
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
@@ -55,18 +59,37 @@ func Open(dir string, opts Options) (*Store, error) {
 	return s, nil
 }
 
+// The manifest is the only record of which files are live. Flush and compaction write
+// their new files first and then atomically replace the manifest, so anything the
+// manifest doesn't list was left behind by an interrupted operation and is deleted.
+// WALs below the manifest's log number are already in SSTables; replaying them would
+// resurrect overwritten values.
 func (s *Store) recover(ssts, wals []uint64) error {
-	var newestSST uint64
+	m, found, err := readManifest(s.dir)
+	if err != nil {
+		return err
+	}
+	if !found && len(ssts) > 0 {
+		return fmt.Errorf("storage: SSTables exist but %s is missing", manifestName)
+	}
+	s.nextNum = slices.Max(slices.Concat(ssts, wals, m.tables, []uint64{m.logNum})) + 1
+
 	for _, num := range ssts {
-		table, err := openSSTable(s.path(num, "sst"))
+		if !slices.Contains(m.tables, num) {
+			if err := os.Remove(s.path(num, "sst")); err != nil {
+				return err
+			}
+		}
+	}
+	for _, num := range m.tables {
+		table, err := s.openTable(num)
 		if err != nil {
 			return err
 		}
 		s.tables = append([]*sstable{table}, s.tables...)
-		newestSST = num
 	}
 	for _, num := range wals {
-		if num < newestSST {
+		if num < m.logNum {
 			if err := os.Remove(s.path(num, "wal")); err != nil {
 				return err
 			}
@@ -82,7 +105,6 @@ func (s *Store) recover(ssts, wals []uint64) error {
 		}
 		s.wal, s.walNum = wal, num
 	}
-	s.nextNum = max(newestSST, s.walNum) + 1
 	if s.wal != nil {
 		return nil
 	}
@@ -141,8 +163,8 @@ func (s *Store) write(rec Record) error {
 		return s.err
 	}
 	if s.memSize >= s.opts.MemtableSize {
-		if err := s.flush(); err != nil {
-			s.err = fmt.Errorf("storage: flush failed, store is read-only: %w", err)
+		if err := s.flushAndCompact(); err != nil {
+			s.err = fmt.Errorf("storage: flush or compaction failed, store is read-only: %w", err)
 			return s.err
 		}
 	}
@@ -158,8 +180,18 @@ func (s *Store) apply(rec Record) {
 	s.memSize += len(rec.Key) + len(rec.Value)
 }
 
-// Any failure here is fatal to the store: once SSTable N is renamed into place, the
-// current WAL counts as flushed, so continuing to append to it would lose writes.
+func (s *Store) flushAndCompact() error {
+	if err := s.flush(); err != nil {
+		return err
+	}
+	if len(s.tables) < s.opts.CompactionTrigger {
+		return nil
+	}
+	return s.compact()
+}
+
+// Any failure here is fatal to the store: the manifest may already name the new WAL,
+// in which case recovery would discard the old one and lose writes appended to it.
 func (s *Store) flush() error {
 	recs := make([]Record, 0, len(s.mem))
 	for _, rec := range s.mem {
@@ -167,25 +199,88 @@ func (s *Store) flush() error {
 	}
 	slices.SortFunc(recs, func(a, b Record) int { return bytes.Compare(a.Key, b.Key) })
 
-	sstNum := s.nextNum
-	s.nextNum++
-	if err := writeSSTable(s.path(sstNum, "sst"), recs); err != nil {
-		return err
-	}
-	table, err := openSSTable(s.path(sstNum, "sst"))
+	table, err := s.writeTable(recs)
 	if err != nil {
 		return err
 	}
-	s.tables = append([]*sstable{table}, s.tables...)
-
 	oldWAL, oldNum := s.wal, s.walNum
 	if err := s.openNewWAL(); err != nil {
+		return err
+	}
+	if err := s.commit(append([]*sstable{table}, s.tables...)); err != nil {
 		return err
 	}
 	s.mem, s.memSize = map[string]Record{}, 0
 	oldWAL.Close()
 	os.Remove(s.path(oldNum, "wal"))
 	return nil
+}
+
+// Merging every table means no older table can still hold a key, so tombstones and
+// overwritten values can be dropped. A partial merge must keep its tombstones.
+func (s *Store) compact() error {
+	merged := map[string]Record{}
+	for _, t := range slices.Backward(s.tables) {
+		recs, err := t.all()
+		if err != nil {
+			return err
+		}
+		for _, rec := range recs {
+			merged[string(rec.Key)] = rec
+		}
+	}
+	live := make([]Record, 0, len(merged))
+	for _, rec := range merged {
+		if rec.Op == OpPut {
+			live = append(live, rec)
+		}
+	}
+	slices.SortFunc(live, func(a, b Record) int { return bytes.Compare(a.Key, b.Key) })
+
+	table, err := s.writeTable(live)
+	if err != nil {
+		return err
+	}
+	inputs := s.tables
+	if err := s.commit([]*sstable{table}); err != nil {
+		table.close()
+		return err
+	}
+	for _, t := range inputs {
+		t.close()
+		os.Remove(s.path(t.num, "sst"))
+	}
+	return nil
+}
+
+func (s *Store) commit(tables []*sstable) error {
+	m := manifest{logNum: s.walNum}
+	for _, t := range slices.Backward(tables) {
+		m.tables = append(m.tables, t.num)
+	}
+	if err := writeManifest(s.dir, m); err != nil {
+		return err
+	}
+	s.tables = tables
+	return nil
+}
+
+func (s *Store) writeTable(recs []Record) (*sstable, error) {
+	num := s.nextNum
+	s.nextNum++
+	if err := writeSSTable(s.path(num, "sst"), recs); err != nil {
+		return nil, err
+	}
+	return s.openTable(num)
+}
+
+func (s *Store) openTable(num uint64) (*sstable, error) {
+	table, err := openSSTable(s.path(num, "sst"))
+	if err != nil {
+		return nil, err
+	}
+	table.num = num
+	return table, nil
 }
 
 func (s *Store) path(num uint64, ext string) string {

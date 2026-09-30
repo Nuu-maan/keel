@@ -55,6 +55,23 @@ func TestSSTableLookup(t *testing.T) {
 	}
 }
 
+func TestSSTableAllReturnsEveryRecordInOrder(t *testing.T) {
+	recs := sampleRecords(3000)
+	_, table := buildSSTable(t, recs)
+	got, err := table.all()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != len(recs) {
+		t.Fatalf("got %d records, want %d", len(got), len(recs))
+	}
+	for i := range recs {
+		if got[i].Op != recs[i].Op || string(got[i].Key) != string(recs[i].Key) || string(got[i].Value) != string(recs[i].Value) {
+			t.Fatalf("record %d = %+v, want %+v", i, got[i], recs[i])
+		}
+	}
+}
+
 func TestSSTableEmpty(t *testing.T) {
 	_, table := buildSSTable(t, nil)
 	if _, ok, err := table.get([]byte("k")); ok || err != nil {

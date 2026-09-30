@@ -168,6 +168,31 @@ func (w *WAL) Close() error {
 	return w.f.Close()
 }
 
+func writeFileAtomic(path string, data []byte) error {
+	tmp := path + ".tmp"
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	_, err = f.Write(data)
+	if err == nil {
+		err = f.Sync()
+	}
+	if closeErr := f.Close(); err == nil {
+		err = closeErr
+	}
+	if err == nil {
+		err = os.Rename(tmp, path)
+	}
+	if err == nil {
+		err = syncDir(filepath.Dir(path))
+	}
+	if err != nil {
+		os.Remove(tmp)
+	}
+	return err
+}
+
 func syncDir(dir string) error {
 	d, err := os.Open(dir)
 	if err != nil {

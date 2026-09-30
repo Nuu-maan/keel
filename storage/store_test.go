@@ -55,7 +55,7 @@ func TestStoreCopiesValues(t *testing.T) {
 
 const crashDirEnv = "KEEL_CRASH_DIR"
 
-var crashOpts = Options{MemtableSize: 4 << 10}
+var crashOpts = Options{MemtableSize: 4 << 10, CompactionTrigger: 3}
 
 func TestCrashRecovery(t *testing.T) {
 	if dir := os.Getenv(crashDirEnv); dir != "" {
@@ -77,8 +77,13 @@ func TestCrashRecovery(t *testing.T) {
 		}
 		s.Close()
 	}
-	if ssts, _ := filepath.Glob(filepath.Join(dir, "*.sst")); len(ssts) == 0 {
-		t.Fatal("writer never flushed, so crashes during flush were not exercised")
+	s, err := Open(dir, crashOpts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if s.nextNum < 20 {
+		t.Fatalf("only %d files ever created, so crashes during flush and compaction were barely exercised", s.nextNum)
 	}
 }
 
@@ -156,8 +161,11 @@ func TestStoreMatchesModelAcrossFlushesAndReopens(t *testing.T) {
 		}
 	}
 
-	if len(s.tables) < 5 {
-		t.Fatalf("expected several flushes, got %d SSTables", len(s.tables))
+	if len(s.tables) >= defaultCompactionTrigger {
+		t.Fatalf("%d SSTables, compaction should keep it below %d", len(s.tables), defaultCompactionTrigger)
+	}
+	if ssts, _ := filepath.Glob(filepath.Join(dir, "*.sst")); len(ssts) != len(s.tables) {
+		t.Fatalf("%d SSTable files on disk for %d live tables", len(ssts), len(s.tables))
 	}
 	for i := range 500 {
 		key := fmt.Sprintf("k%04d", i)
@@ -178,18 +186,31 @@ func TestStoreMatchesModelAcrossFlushesAndReopens(t *testing.T) {
 	}
 }
 
-func TestOpenDiscardsFlushedWALs(t *testing.T) {
+func TestOpenDeletesFilesNotInManifest(t *testing.T) {
 	dir := t.TempDir()
-	stale, err := OpenWAL(filepath.Join(dir, "000001.wal"), func(Record) {})
-	if err != nil {
+	put := func(key, value string) Record { return Record{Op: OpPut, Key: []byte(key), Value: []byte(value)} }
+	writeWAL := func(name string, rec Record) {
+		w, err := OpenWAL(filepath.Join(dir, name), func(Record) {})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := w.Append(rec); err != nil {
+			t.Fatal(err)
+		}
+		w.Close()
+	}
+	writeWAL("000001.wal", put("k", "stale"))
+	if err := writeSSTable(filepath.Join(dir, "000002.sst"), []Record{put("k", "flushed")}); err != nil {
 		t.Fatal(err)
 	}
-	stale.Append(Record{Op: OpPut, Key: []byte("k"), Value: []byte("stale")})
-	stale.Close()
-	if err := writeSSTable(filepath.Join(dir, "000002.sst"), []Record{{Op: OpPut, Key: []byte("k"), Value: []byte("new")}}); err != nil {
+	writeWAL("000003.wal", put("live", "yes"))
+	if err := writeSSTable(filepath.Join(dir, "000004.sst"), []Record{put("k", "orphan")}); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "000003.sst.tmp"), []byte("partial"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "000005.sst.tmp"), []byte("partial"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeManifest(dir, manifest{logNum: 3, tables: []uint64{2}}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -198,12 +219,86 @@ func TestOpenDiscardsFlushedWALs(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.Close()
-	if v, err := s.Get([]byte("k")); err != nil || string(v) != "new" {
-		t.Fatalf("k = %q, %v; stale WAL was replayed over the SSTable", v, err)
+	for key, want := range map[string]string{"k": "flushed", "live": "yes"} {
+		if v, err := s.Get([]byte(key)); err != nil || string(v) != want {
+			t.Fatalf("%s = %q, %v; want %q", key, v, err, want)
+		}
 	}
-	for _, gone := range []string{"000001.wal", "000003.sst.tmp"} {
+	for _, gone := range []string{"000001.wal", "000004.sst", "000005.sst.tmp"} {
 		if _, err := os.Stat(filepath.Join(dir, gone)); !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("%s should have been removed, stat err = %v", gone, err)
 		}
+	}
+}
+
+func TestOpenRefusesSSTablesWithoutManifest(t *testing.T) {
+	dir := t.TempDir()
+	if err := writeSSTable(filepath.Join(dir, "000001.sst"), nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(dir, Options{}); err == nil {
+		t.Fatal("opened a store whose manifest is missing")
+	}
+}
+
+func TestCompactionDropsOverwritesAndTombstones(t *testing.T) {
+	dir := t.TempDir()
+	opts := Options{MemtableSize: 1 << 10, CompactionTrigger: 1000}
+	s, err := Open(dir, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { s.Close() }()
+	for round := range 5 {
+		for i := range 100 {
+			key := fmt.Appendf(nil, "k%03d", i)
+			if round == 4 && i%2 == 0 {
+				if err := s.Delete(key); err != nil {
+					t.Fatal(err)
+				}
+				continue
+			}
+			if err := s.Put(key, fmt.Appendf(nil, "v%d", round)); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	s.mu.Lock()
+	if err := s.flush(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.compact(); err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Unlock()
+
+	if len(s.tables) != 1 {
+		t.Fatalf("%d tables after compaction, want 1", len(s.tables))
+	}
+	recs, err := s.tables[0].all()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recs) != 50 {
+		t.Fatalf("compacted table holds %d records, want the 50 live keys", len(recs))
+	}
+	for _, rec := range recs {
+		if rec.Op != OpPut || string(rec.Value) != "v4" {
+			t.Fatalf("unexpected record in compacted table: %+v", rec)
+		}
+	}
+
+	s.Close()
+	if s, err = Open(dir, opts); err != nil {
+		t.Fatal(err)
+	}
+	for i := range 100 {
+		v, err := s.Get(fmt.Appendf(nil, "k%03d", i))
+		if i%2 == 0 && !errors.Is(err, ErrNotFound) || i%2 == 1 && (err != nil || string(v) != "v4") {
+			t.Fatalf("k%03d = %q, %v after reopen", i, v, err)
+		}
+	}
+	if ssts, _ := filepath.Glob(filepath.Join(dir, "*.sst")); len(ssts) != 1 {
+		t.Fatalf("compaction inputs left on disk: %v", ssts)
 	}
 }

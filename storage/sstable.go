@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"hash/crc32"
 	"os"
-	"path/filepath"
 	"sort"
 )
 
@@ -17,28 +16,7 @@ const (
 )
 
 func writeSSTable(path string, recs []Record) error {
-	tmp := path + ".tmp"
-	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
-	if err != nil {
-		return err
-	}
-	_, err = f.Write(encodeSSTable(recs))
-	if err == nil {
-		err = f.Sync()
-	}
-	if closeErr := f.Close(); err == nil {
-		err = closeErr
-	}
-	if err == nil {
-		err = os.Rename(tmp, path)
-	}
-	if err == nil {
-		err = syncDir(filepath.Dir(path))
-	}
-	if err != nil {
-		os.Remove(tmp)
-	}
-	return err
+	return writeFileAtomic(path, encodeSSTable(recs))
 }
 
 func encodeSSTable(recs []Record) []byte {
@@ -85,6 +63,7 @@ type blockHandle struct {
 }
 
 type sstable struct {
+	num    uint64
 	f      *os.File
 	filter []byte
 	index  []blockHandle
@@ -178,32 +157,61 @@ func (t *sstable) get(key []byte) (Record, bool, error) {
 	if i == len(t.index) {
 		return Record{}, false, nil
 	}
-	h := t.index[i]
+	var found Record
+	var ok bool
+	err := t.scanBlock(t.index[i], func(rec Record) bool {
+		switch bytes.Compare(rec.Key, key) {
+		case 0:
+			found, ok = rec, true
+			return false
+		case 1:
+			return false
+		}
+		return true
+	})
+	return found, ok, err
+}
+
+func (t *sstable) all() ([]Record, error) {
+	var recs []Record
+	for _, h := range t.index {
+		err := t.scanBlock(h, func(rec Record) bool {
+			recs = append(recs, rec)
+			return true
+		})
+		if err != nil {
+			return nil, err
+		}
+	}
+	return recs, nil
+}
+
+func (t *sstable) scanBlock(h blockHandle, visit func(Record) bool) error {
 	block := make([]byte, h.length)
 	if _, err := t.f.ReadAt(block, int64(h.offset)); err != nil {
-		return Record{}, false, err
+		return err
 	}
 	data, sum := block[:len(block)-4], block[len(block)-4:]
 	if crc32.Checksum(data, crcTable) != binary.LittleEndian.Uint32(sum) {
-		return Record{}, false, fmt.Errorf("%s: %w in block at offset %d", t.f.Name(), ErrCorrupt, h.offset)
+		return t.corruptBlock(h)
 	}
-
 	c := cursor{buf: data}
 	for len(c.buf) > 0 {
 		k := c.bytes(c.uvarint())
 		kind := c.bytes(1)
 		v := c.bytes(c.uvarint())
 		if c.bad || (Op(kind[0]) != OpPut && Op(kind[0]) != OpDelete) {
-			return Record{}, false, fmt.Errorf("%s: %w in block at offset %d", t.f.Name(), ErrCorrupt, h.offset)
+			return t.corruptBlock(h)
 		}
-		switch bytes.Compare(k, key) {
-		case 0:
-			return Record{Op: Op(kind[0]), Key: k, Value: v}, true, nil
-		case 1:
-			return Record{}, false, nil
+		if !visit(Record{Op: Op(kind[0]), Key: k, Value: v}) {
+			return nil
 		}
 	}
-	return Record{}, false, nil
+	return nil
+}
+
+func (t *sstable) corruptBlock(h blockHandle) error {
+	return fmt.Errorf("%s: %w in block at offset %d", t.f.Name(), ErrCorrupt, h.offset)
 }
 
 func (t *sstable) close() error {

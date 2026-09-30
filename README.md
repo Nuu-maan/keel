@@ -13,9 +13,11 @@ The goal is correctness under failure first, then performance. Every durability 
 | Write-ahead log with crash recovery | Done |
 | Memtable with tombstones | Done |
 | SSTables, memtable flush, WAL rotation | Done |
-| Background flush | Planned ([#7](https://github.com/Nuu-maan/keel/issues/7)) |
 | Bloom filters | Done |
-| Compaction | Planned ([#9](https://github.com/Nuu-maan/keel/issues/9)) |
+| Manifest-based recovery | Done |
+| Full compaction | Done |
+| Leveled compaction | Planned ([#13](https://github.com/Nuu-maan/keel/issues/13)) |
+| Background flush and compaction | Planned ([#7](https://github.com/Nuu-maan/keel/issues/7)) |
 | TCP wire protocol | Planned |
 | Raft replication | Planned |
 | Chaos testing with linearizability checking | Planned |
@@ -63,21 +65,28 @@ Truncating at real corruption would silently drop the acknowledged writes that f
 
 SSTables are checked the same way. The footer, the index and every data block carry a CRC32C checksum, and a mismatch fails the read with `ErrCorrupt` instead of returning bad data.
 
-**Crash-safe flush.** When the memtable reaches its size limit (4 MiB by default), it is written to an SSTable and the WAL is rotated:
+**The manifest is the commit point.** A `MANIFEST` file lists the live SSTables and the first WAL to replay. Flush and compaction never change live files in place. Each one writes its new files, then replaces the manifest atomically (write to `MANIFEST.tmp`, `fsync`, rename, `fsync` the directory). Until that rename lands, the old state is still complete, and afterwards the new one is.
 
-1. Sort the memtable and write SSTable `N` to `N.sst.tmp`, then `fsync` it.
-2. Rename it to `N.sst` and `fsync` the directory.
-3. Open a new WAL numbered `N+1`, and delete the old one.
+**Flush.** When the memtable reaches its size limit (4 MiB by default):
 
-Data files share one increasing sequence of numbers, so no manifest is needed for recovery:
+1. Write the sorted memtable to SSTable `N`, using the same atomic write.
+2. Open a new WAL, `N+1`.
+3. Commit a manifest that lists `N` and names `N+1` as the first WAL to replay.
+4. Delete the old WAL.
+
+**Compaction.** When the table count reaches a trigger (4 by default), every SSTable is merged into one, newest version first. Because the merge includes the oldest table, nothing older is left that could still hold a deleted or overwritten key, so tombstones and stale versions are dropped. The new manifest lists only the output table, and the inputs are then deleted. Full compaction rewrites all live data each time; leveled compaction is tracked in [#13](https://github.com/Nuu-maan/keel/issues/13).
+
+**Recovery** follows the manifest and deletes whatever it doesn't reference:
 
 | Found on open | Meaning | Action |
 |---|---|---|
-| `*.tmp` | Flush interrupted before the rename | Delete |
-| WAL numbered below the newest SSTable | Already flushed | Delete without replaying. Replaying it would bring back overwritten values |
-| WAL numbered above the newest SSTable | Holds unflushed writes | Replay into the memtable |
+| `*.tmp` | Interrupted atomic write | Delete |
+| SSTable not in the manifest | Output of an interrupted flush or compaction, or a leftover compaction input | Delete |
+| WAL below the manifest's log number | Already flushed | Delete without replaying. Replaying it would bring back overwritten values |
+| WAL at or above the log number | Holds unflushed writes | Replay into the memtable |
+| SSTables but no manifest | Unknown state | Refuse to open |
 
-A flush error of any kind makes the store read-only. Once `N.sst` exists, the old WAL counts as flushed, so appending to it again would lose writes.
+Any error during flush or compaction makes the store read-only. After a partially applied manifest update, the store can't tell which WAL recovery will replay, so accepting more writes could lose them.
 
 **Reads.** `Get` checks the memtable first, then SSTables from newest to oldest, and stops at the first match. A tombstone means the key is deleted, even if an older table still holds a value. Each SSTable's bloom filter is checked before its index, so for a key the table doesn't contain, about 99% of lookups skip the disk read entirely.
 
@@ -116,10 +125,11 @@ section : offset (8) | length (4) | crc32c (4)
 
 Tests aim at failure modes, not just happy paths.
 
-- **Crash recovery.** The test re-runs its own binary as a writer subprocess that prints each key once `Put` returns. The parent sends `SIGKILL` after a random number of acknowledgements, reopens the store and checks every acknowledged key. This runs for 20 rounds. The memtable is kept small, so kills also land in the middle of flushes and WAL rotations.
-- **Mutation-checked.** Each durability test has been seen to fail against a deliberately broken store. Skipping WAL appends, replaying flushed WALs, deleting the live WAL and ignoring tombstones are each caught. A durability test that can't fail proves nothing.
+- **Crash recovery.** The test re-runs its own binary as a writer subprocess that prints each key once `Put` returns. The parent sends `SIGKILL` after a random number of acknowledgements, reopens the store and checks every acknowledged key. This runs for 20 rounds. The memtable and compaction trigger are kept small, so kills also land in the middle of flushes, manifest commits and compactions.
+- **Mutation-checked.** Each durability test has been seen to fail against a deliberately broken store. Skipping WAL appends, replaying flushed WALs, deleting the live WAL, ignoring tombstones and keeping tombstones through compaction are each caught. A durability test that can't fail proves nothing.
 - **Model-based.** 5000 random puts and deletes on a small memtable, so the run goes through many flushes and several reopens. Afterwards every key is checked against a plain Go map.
-- **Recovery rules.** A test plants a stale WAL under a newer SSTable, plus a half-written `.tmp` file, and checks that opening the store deletes both and doesn't replay the stale values.
+- **Recovery rules.** A test plants a flushed WAL, an orphaned SSTable and a half-written `.tmp` file next to a manifest. Opening the store must delete all three and serve neither the stale nor the orphaned values. A store with SSTables but no manifest refuses to open.
+- **Compaction.** Five rounds of overwrites and deletes over 100 keys are compacted into one table. It must hold exactly the 50 live keys at their latest values, with no tombstones, and the result must survive a reopen.
 - **Torn writes and corruption.** For the WAL: partial headers, partial payloads, zero-filled tails and a damaged last record are recovered. A damaged checksum, length or payload in the middle of the file is rejected. For SSTables: damaged blocks, filter, index, footer and magic number are all detected.
 - **Filter effectiveness.** A test fills an SSTable's data blocks with garbage but leaves the filter and index intact. Lookups for absent keys still succeed, because the filter stops them before any block is read. With the filter disabled, 1999 of 2000 of those lookups read a block.
 - **Race detector.** CI runs the whole suite with `-race`.
@@ -137,12 +147,13 @@ storage/
   wal.go       write-ahead log: record format, append, replay, torn-tail recovery
   sstable.go   SSTable writer and reader: blocks, filter, index, footer
   bloom.go     bloom filter
-  store.go     memtable, flush, WAL rotation, recovery, read path
+  manifest.go  live-file manifest, replaced atomically
+  store.go     memtable, flush, compaction, recovery, read path
 ```
 
 ## Roadmap
 
-1. **Storage engine.** Compaction ([#9](https://github.com/Nuu-maan/keel/issues/9)), background flush ([#7](https://github.com/Nuu-maan/keel/issues/7)), group commit ([#1](https://github.com/Nuu-maan/keel/issues/1)).
+1. **Storage engine.** Leveled compaction ([#13](https://github.com/Nuu-maan/keel/issues/13)), background flush ([#7](https://github.com/Nuu-maan/keel/issues/7)), group commit ([#1](https://github.com/Nuu-maan/keel/issues/1)).
 2. **Wire protocol.** Length-prefixed binary framing over TCP, with deadlines and backpressure.
 3. **Raft.** Leader election, log replication, snapshots, and linearizable reads through ReadIndex.
 4. **Chaos testing.** Process kills, `SIGSTOP`, network partitions with `iptables`, latency with `tc netem`. Recorded histories checked for linearizability with [Porcupine](https://github.com/anishathalye/porcupine).
