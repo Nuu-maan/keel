@@ -12,8 +12,8 @@ import (
 
 const (
 	targetBlockSize = 4 << 10
-	footerSize      = 24
-	sstMagic        = 0x4b45454c53535431
+	footerSize      = 40
+	sstMagic        = 0x4b45454c53535432
 )
 
 func writeSSTable(path string, recs []Record) error {
@@ -43,7 +43,9 @@ func writeSSTable(path string, recs []Record) error {
 
 func encodeSSTable(recs []Record) []byte {
 	var out, block, index []byte
+	hashes := make([]uint64, len(recs))
 	for i, rec := range recs {
+		hashes[i] = bloomHash(rec.Key)
 		block = binary.AppendUvarint(block, uint64(len(rec.Key)))
 		block = append(block, rec.Key...)
 		block = append(block, byte(rec.Op))
@@ -60,12 +62,20 @@ func encodeSSTable(recs []Record) []byte {
 		out = append(out, block...)
 		block = block[:0]
 	}
+	filter := newBloom(hashes)
+	filterOffset := len(out)
+	out = append(out, filter...)
 	indexOffset := len(out)
 	out = append(out, index...)
-	out = binary.LittleEndian.AppendUint64(out, uint64(indexOffset))
-	out = binary.LittleEndian.AppendUint32(out, uint32(len(index)))
-	out = binary.LittleEndian.AppendUint32(out, crc32.Checksum(index, crcTable))
+	out = appendSection(out, filterOffset, filter)
+	out = appendSection(out, indexOffset, index)
 	return binary.LittleEndian.AppendUint64(out, sstMagic)
+}
+
+func appendSection(out []byte, offset int, data []byte) []byte {
+	out = binary.LittleEndian.AppendUint64(out, uint64(offset))
+	out = binary.LittleEndian.AppendUint32(out, uint32(len(data)))
+	return binary.LittleEndian.AppendUint32(out, crc32.Checksum(data, crcTable))
 }
 
 type blockHandle struct {
@@ -75,8 +85,9 @@ type blockHandle struct {
 }
 
 type sstable struct {
-	f     *os.File
-	index []blockHandle
+	f      *os.File
+	filter []byte
+	index  []blockHandle
 }
 
 func openSSTable(path string) (*sstable, error) {
@@ -84,15 +95,39 @@ func openSSTable(path string) (*sstable, error) {
 	if err != nil {
 		return nil, err
 	}
-	index, err := readIndex(f)
+	t, err := readMeta(f)
 	if err != nil {
 		f.Close()
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
-	return &sstable{f: f, index: index}, nil
+	return t, nil
 }
 
-func readIndex(f *os.File) ([]blockHandle, error) {
+type section struct {
+	offset, length uint64
+	crc            uint32
+}
+
+func parseSection(b []byte) section {
+	return section{
+		offset: binary.LittleEndian.Uint64(b[0:8]),
+		length: uint64(binary.LittleEndian.Uint32(b[8:12])),
+		crc:    binary.LittleEndian.Uint32(b[12:16]),
+	}
+}
+
+func readSection(f *os.File, s section) ([]byte, error) {
+	buf := make([]byte, s.length)
+	if _, err := f.ReadAt(buf, int64(s.offset)); err != nil {
+		return nil, err
+	}
+	if crc32.Checksum(buf, crcTable) != s.crc {
+		return nil, ErrCorrupt
+	}
+	return buf, nil
+}
+
+func readMeta(f *os.File) (*sstable, error) {
 	info, err := f.Stat()
 	if err != nil {
 		return nil, err
@@ -105,32 +140,38 @@ func readIndex(f *os.File) ([]blockHandle, error) {
 	if _, err := f.ReadAt(footer, int64(size-footerSize)); err != nil {
 		return nil, err
 	}
-	indexOffset := binary.LittleEndian.Uint64(footer[0:8])
-	indexLen := uint64(binary.LittleEndian.Uint32(footer[8:12]))
-	if binary.LittleEndian.Uint64(footer[16:24]) != sstMagic || indexOffset > size || indexOffset+indexLen != size-footerSize {
+	filterSec, indexSec := parseSection(footer[0:16]), parseSection(footer[16:32])
+	if binary.LittleEndian.Uint64(footer[32:40]) != sstMagic ||
+		filterSec.offset > size || filterSec.offset+filterSec.length != indexSec.offset ||
+		indexSec.offset > size || indexSec.offset+indexSec.length != size-footerSize {
 		return nil, ErrCorrupt
 	}
-	buf := make([]byte, indexLen)
-	if _, err := f.ReadAt(buf, int64(indexOffset)); err != nil {
+	filter, err := readSection(f, filterSec)
+	if err != nil {
 		return nil, err
 	}
-	if crc32.Checksum(buf, crcTable) != binary.LittleEndian.Uint32(footer[12:16]) {
-		return nil, ErrCorrupt
+	buf, err := readSection(f, indexSec)
+	if err != nil {
+		return nil, err
 	}
 
+	dataEnd := filterSec.offset
 	var index []blockHandle
 	c := cursor{buf: buf}
 	for len(c.buf) > 0 {
 		h := blockHandle{lastKey: c.bytes(c.uvarint()), offset: c.uvarint(), length: c.uvarint()}
-		if c.bad || h.length < 4 || h.length > indexOffset || h.offset > indexOffset-h.length {
+		if c.bad || h.length < 4 || h.length > dataEnd || h.offset > dataEnd-h.length {
 			return nil, ErrCorrupt
 		}
 		index = append(index, h)
 	}
-	return index, nil
+	return &sstable{f: f, filter: filter, index: index}, nil
 }
 
 func (t *sstable) get(key []byte) (Record, bool, error) {
+	if !bloomMayContain(t.filter, key) {
+		return Record{}, false, nil
+	}
 	i := sort.Search(len(t.index), func(i int) bool {
 		return bytes.Compare(t.index[i].lastKey, key) >= 0
 	})
