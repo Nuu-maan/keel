@@ -13,7 +13,7 @@ import (
 
 func TestStoreSurvivesReopen(t *testing.T) {
 	dir := t.TempDir()
-	s, err := Open(dir)
+	s, err := Open(dir, Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -23,7 +23,7 @@ func TestStoreSurvivesReopen(t *testing.T) {
 	s.Delete([]byte("k2"))
 	s.Close()
 
-	s, err = Open(dir)
+	s, err = Open(dir, Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -37,7 +37,7 @@ func TestStoreSurvivesReopen(t *testing.T) {
 }
 
 func TestStoreCopiesValues(t *testing.T) {
-	s, err := Open(t.TempDir())
+	s, err := Open(t.TempDir(), Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -63,7 +63,7 @@ func TestCrashRecovery(t *testing.T) {
 	for round := range 20 {
 		acked := killWriterAfter(t, dir, 1+rand.IntN(300))
 
-		s, err := Open(dir)
+		s, err := Open(dir, Options{})
 		if err != nil {
 			t.Fatalf("round %d: reopen: %v", round, err)
 		}
@@ -101,7 +101,7 @@ func killWriterAfter(t *testing.T, dir string, acks int) []string {
 }
 
 func runCrashWriter(dir string) {
-	s, err := Open(dir)
+	s, err := Open(dir, Options{})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)

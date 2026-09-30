@@ -13,21 +13,33 @@ import (
 
 var ErrNotFound = errors.New("storage: key not found")
 
+const defaultMemtableSize = 4 << 20
+
+type Options struct {
+	MemtableSize int
+}
+
 type Store struct {
-	dir string
+	dir  string
+	opts Options
 
 	mu      sync.RWMutex
 	wal     *WAL
 	walNum  uint64
 	mem     map[string]Record
+	memSize int
 	tables  []*sstable
 	nextNum uint64
+	err     error
 }
 
 // Files share one increasing number sequence. Flush writes SSTable N and only then
 // opens WAL N+1, so on recovery any WAL numbered below the newest SSTable is already
 // flushed and must be deleted, not replayed: replaying it would resurrect stale values.
-func Open(dir string) (*Store, error) {
+func Open(dir string, opts Options) (*Store, error) {
+	if opts.MemtableSize <= 0 {
+		opts.MemtableSize = defaultMemtableSize
+	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
@@ -35,7 +47,7 @@ func Open(dir string) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	s := &Store{dir: dir, mem: map[string]Record{}, nextNum: 1}
+	s := &Store{dir: dir, opts: opts, mem: map[string]Record{}, nextNum: 1}
 	if err := s.recover(ssts, wals); err != nil {
 		s.Close()
 		return nil, err
@@ -125,6 +137,15 @@ func (s *Store) Close() error {
 func (s *Store) write(rec Record) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.err != nil {
+		return s.err
+	}
+	if s.memSize >= s.opts.MemtableSize {
+		if err := s.flush(); err != nil {
+			s.err = fmt.Errorf("storage: flush failed, store is read-only: %w", err)
+			return s.err
+		}
+	}
 	if err := s.wal.Append(rec); err != nil {
 		return err
 	}
@@ -134,6 +155,37 @@ func (s *Store) write(rec Record) error {
 
 func (s *Store) apply(rec Record) {
 	s.mem[string(rec.Key)] = rec
+	s.memSize += len(rec.Key) + len(rec.Value)
+}
+
+// Any failure here is fatal to the store: once SSTable N is renamed into place, the
+// current WAL counts as flushed, so continuing to append to it would lose writes.
+func (s *Store) flush() error {
+	recs := make([]Record, 0, len(s.mem))
+	for _, rec := range s.mem {
+		recs = append(recs, rec)
+	}
+	slices.SortFunc(recs, func(a, b Record) int { return bytes.Compare(a.Key, b.Key) })
+
+	sstNum := s.nextNum
+	s.nextNum++
+	if err := writeSSTable(s.path(sstNum, "sst"), recs); err != nil {
+		return err
+	}
+	table, err := openSSTable(s.path(sstNum, "sst"))
+	if err != nil {
+		return err
+	}
+	s.tables = append([]*sstable{table}, s.tables...)
+
+	oldWAL, oldNum := s.wal, s.walNum
+	if err := s.openNewWAL(); err != nil {
+		return err
+	}
+	s.mem, s.memSize = map[string]Record{}, 0
+	oldWAL.Close()
+	os.Remove(s.path(oldNum, "wal"))
+	return nil
 }
 
 func (s *Store) path(num uint64, ext string) string {
