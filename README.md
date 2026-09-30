@@ -199,12 +199,7 @@ storage/
   bloom.go     bloom filter
   manifest.go  live-file manifest, replaced atomically
   store.go     memtable, flush, compaction, recovery, read path
-docs/diagrams/
-  *.js         diagram sources, drawn with rough.js
-  render.sh    re-renders every PNG with headless Chromium
 ```
-
-To change a diagram, edit its `.js` file and run `docs/diagrams/render.sh <name>`.
 
 ## Roadmap
 
