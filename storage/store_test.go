@@ -178,18 +178,31 @@ func TestStoreMatchesModelAcrossFlushesAndReopens(t *testing.T) {
 	}
 }
 
-func TestOpenDiscardsFlushedWALs(t *testing.T) {
+func TestOpenDeletesFilesNotInManifest(t *testing.T) {
 	dir := t.TempDir()
-	stale, err := OpenWAL(filepath.Join(dir, "000001.wal"), func(Record) {})
-	if err != nil {
+	put := func(key, value string) Record { return Record{Op: OpPut, Key: []byte(key), Value: []byte(value)} }
+	writeWAL := func(name string, rec Record) {
+		w, err := OpenWAL(filepath.Join(dir, name), func(Record) {})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := w.Append(rec); err != nil {
+			t.Fatal(err)
+		}
+		w.Close()
+	}
+	writeWAL("000001.wal", put("k", "stale"))
+	if err := writeSSTable(filepath.Join(dir, "000002.sst"), []Record{put("k", "flushed")}); err != nil {
 		t.Fatal(err)
 	}
-	stale.Append(Record{Op: OpPut, Key: []byte("k"), Value: []byte("stale")})
-	stale.Close()
-	if err := writeSSTable(filepath.Join(dir, "000002.sst"), []Record{{Op: OpPut, Key: []byte("k"), Value: []byte("new")}}); err != nil {
+	writeWAL("000003.wal", put("live", "yes"))
+	if err := writeSSTable(filepath.Join(dir, "000004.sst"), []Record{put("k", "orphan")}); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "000003.sst.tmp"), []byte("partial"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "000005.sst.tmp"), []byte("partial"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeManifest(dir, manifest{logNum: 3, tables: []uint64{2}}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -198,12 +211,24 @@ func TestOpenDiscardsFlushedWALs(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.Close()
-	if v, err := s.Get([]byte("k")); err != nil || string(v) != "new" {
-		t.Fatalf("k = %q, %v; stale WAL was replayed over the SSTable", v, err)
+	for key, want := range map[string]string{"k": "flushed", "live": "yes"} {
+		if v, err := s.Get([]byte(key)); err != nil || string(v) != want {
+			t.Fatalf("%s = %q, %v; want %q", key, v, err, want)
+		}
 	}
-	for _, gone := range []string{"000001.wal", "000003.sst.tmp"} {
+	for _, gone := range []string{"000001.wal", "000004.sst", "000005.sst.tmp"} {
 		if _, err := os.Stat(filepath.Join(dir, gone)); !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("%s should have been removed, stat err = %v", gone, err)
 		}
+	}
+}
+
+func TestOpenRefusesSSTablesWithoutManifest(t *testing.T) {
+	dir := t.TempDir()
+	if err := writeSSTable(filepath.Join(dir, "000001.sst"), nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(dir, Options{}); err == nil {
+		t.Fatal("opened a store whose manifest is missing")
 	}
 }

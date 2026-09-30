@@ -63,6 +63,7 @@ type blockHandle struct {
 }
 
 type sstable struct {
+	num    uint64
 	f      *os.File
 	filter []byte
 	index  []blockHandle
