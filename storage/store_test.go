@@ -156,8 +156,11 @@ func TestStoreMatchesModelAcrossFlushesAndReopens(t *testing.T) {
 		}
 	}
 
-	if len(s.tables) < 5 {
-		t.Fatalf("expected several flushes, got %d SSTables", len(s.tables))
+	if len(s.tables) >= defaultCompactionTrigger {
+		t.Fatalf("%d SSTables, compaction should keep it below %d", len(s.tables), defaultCompactionTrigger)
+	}
+	if ssts, _ := filepath.Glob(filepath.Join(dir, "*.sst")); len(ssts) != len(s.tables) {
+		t.Fatalf("%d SSTable files on disk for %d live tables", len(ssts), len(s.tables))
 	}
 	for i := range 500 {
 		key := fmt.Sprintf("k%04d", i)
