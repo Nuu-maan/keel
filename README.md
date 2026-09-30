@@ -26,31 +26,17 @@ The goal is correctness under failure first, then performance. Every durability 
 
 ## Architecture
 
-The target design. Only the storage layer exists today.
+The target design. The storage engine is built; the wire protocol and Raft come next.
 
-```mermaid
-flowchart TB
-    client[Client] -- binary protocol over TCP --> leader
-    subgraph cluster[Raft group]
-        leader[Leader]
-        f1[Follower]
-        f2[Follower]
-        leader -- AppendEntries --> f1
-        leader -- AppendEntries --> f2
-    end
-    leader -- committed entries --> engine
-    subgraph engine[Storage engine, per node]
-        wal[(Write-ahead log)] --> mem[Memtable]
-        mem -- flush --> sst[(SSTables)]
-        sst -- compaction --> sst
-    end
-```
+![Keel architecture: clients talk to a Raft leader, which replicates to two followers; each node runs the LSM storage engine](docs/diagrams/architecture.png)
 
 ## Guarantees
 
 **Durability.** A write is acknowledged only after its WAL record has been written and `fsync`ed. An acknowledged write survives a process crash at any point.
 
 **Group commit.** One writer goroutine owns the WAL. Each `Put` or `Delete` sends its record to that goroutine and waits. The writer takes every request already queued, appends the whole batch with one `write` and one `fsync`, applies it to the memtable, and then acknowledges each caller. Durability is unchanged, because nobody is acknowledged before the `fsync` that covers their record. The store lock is held only while applying a batch or swapping in new tables, never across an `fsync`, so reads don't wait on the disk.
+
+![Write path: concurrent Puts are batched by the writer goroutine into one WAL write and fsync, applied to the memtable, flushed to SSTables and committed through the MANIFEST](docs/diagrams/write-path.png)
 
 **Fail-stop on I/O errors.** If a write or `fsync` fails, the WAL refuses every later append. After a failed `fsync` the kernel may already have dropped the dirty pages, and retrying can report success while the data is gone (see [fsyncgate](https://wiki.postgresql.org/wiki/Fsync_Errors)). Stopping is the only safe response.
 
@@ -81,6 +67,8 @@ SSTables are checked the same way. The footer, the index and every data block ca
 
 **Recovery** follows the manifest and deletes whatever it doesn't reference:
 
+![Recovery: files listed in the MANIFEST are kept, WALs at or above its log number are replayed, and everything else is deleted](docs/diagrams/recovery.png)
+
 | Found on open | Meaning | Action |
 |---|---|---|
 | `*.tmp` | Interrupted atomic write | Delete |
@@ -92,6 +80,8 @@ SSTables are checked the same way. The footer, the index and every data block ca
 Any error during flush or compaction makes the store read-only. After a partially applied manifest update, the store can't tell which WAL recovery will replay, so accepting more writes could lose them.
 
 **Reads.** `Get` checks the memtable first, then SSTables from newest to oldest, and stops at the first match. A tombstone means the key is deleted, even if an older table still holds a value. Each SSTable's bloom filter is checked before its index, so for a key the table doesn't contain, about 99% of lookups skip the disk read entirely.
+
+![Read path: Get checks the memtable, then each SSTable newest first; a bloom filter rules most tables out before the block index and a single pread](docs/diagrams/read-path.png)
 
 ## On-disk format
 
@@ -108,6 +98,8 @@ payload : op (1) | key len (uvarint) | key | value
 - The value takes up the rest of the payload, so it has no length prefix of its own.
 
 ### SSTable
+
+![SSTable layout: data blocks, bloom filter, block index and a 40-byte footer, each section checksummed](docs/diagrams/sstable-format.png)
 
 ```
 file    : block* | filter | index | footer
@@ -170,7 +162,12 @@ storage/
   bloom.go     bloom filter
   manifest.go  live-file manifest, replaced atomically
   store.go     memtable, flush, compaction, recovery, read path
+docs/diagrams/
+  *.js         diagram sources, drawn with rough.js
+  render.sh    re-renders every PNG with headless Chromium
 ```
+
+To change a diagram, edit its `.js` file and run `docs/diagrams/render.sh <name>`.
 
 ## Roadmap
 
