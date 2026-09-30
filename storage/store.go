@@ -61,8 +61,9 @@ func Open(dir string, opts Options) (*Store, error) {
 
 // The manifest is the only record of which files are live. Flush and compaction write
 // their new files first and then atomically replace the manifest, so anything the
-// manifest doesn't list was left behind by an interrupted operation and is deleted. WALs below the manifest's log
-// number are already in SSTables; replaying them would resurrect overwritten values.
+// manifest doesn't list was left behind by an interrupted operation and is deleted.
+// WALs below the manifest's log number are already in SSTables; replaying them would
+// resurrect overwritten values.
 func (s *Store) recover(ssts, wals []uint64) error {
 	m, found, err := readManifest(s.dir)
 	if err != nil {
