@@ -235,3 +235,65 @@ func TestOpenRefusesSSTablesWithoutManifest(t *testing.T) {
 		t.Fatal("opened a store whose manifest is missing")
 	}
 }
+
+func TestCompactionDropsOverwritesAndTombstones(t *testing.T) {
+	dir := t.TempDir()
+	opts := Options{MemtableSize: 1 << 10, CompactionTrigger: 1000}
+	s, err := Open(dir, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { s.Close() }()
+	for round := range 5 {
+		for i := range 100 {
+			key := fmt.Appendf(nil, "k%03d", i)
+			if round == 4 && i%2 == 0 {
+				if err := s.Delete(key); err != nil {
+					t.Fatal(err)
+				}
+				continue
+			}
+			if err := s.Put(key, fmt.Appendf(nil, "v%d", round)); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	s.mu.Lock()
+	if err := s.flush(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.compact(); err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Unlock()
+
+	if len(s.tables) != 1 {
+		t.Fatalf("%d tables after compaction, want 1", len(s.tables))
+	}
+	recs, err := s.tables[0].all()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recs) != 50 {
+		t.Fatalf("compacted table holds %d records, want the 50 live keys", len(recs))
+	}
+	for _, rec := range recs {
+		if rec.Op != OpPut || string(rec.Value) != "v4" {
+			t.Fatalf("unexpected record in compacted table: %+v", rec)
+		}
+	}
+
+	s.Close()
+	if s, err = Open(dir, opts); err != nil {
+		t.Fatal(err)
+	}
+	for i := range 100 {
+		v, err := s.Get(fmt.Appendf(nil, "k%03d", i))
+		if i%2 == 0 && !errors.Is(err, ErrNotFound) || i%2 == 1 && (err != nil || string(v) != "v4") {
+			t.Fatalf("k%03d = %q, %v after reopen", i, v, err)
+		}
+	}
+	if ssts, _ := filepath.Glob(filepath.Join(dir, "*.sst")); len(ssts) != 1 {
+		t.Fatalf("compaction inputs left on disk: %v", ssts)
+	}
+}
