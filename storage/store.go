@@ -11,7 +11,10 @@ import (
 	"sync"
 )
 
-var ErrNotFound = errors.New("storage: key not found")
+var (
+	ErrNotFound = errors.New("storage: key not found")
+	ErrClosed   = errors.New("storage: store is closed")
+)
 
 const (
 	defaultMemtableSize      = 4 << 20
@@ -23,18 +26,33 @@ type Options struct {
 	CompactionTrigger int
 }
 
+// Only the writer goroutine touches wal, walNum, memSize, nextNum, err and batches.
+// mu guards mem and tables, which readers also use; the writer holds it only to apply
+// a batch or swap in flushed tables, never across a WAL fsync.
 type Store struct {
 	dir  string
 	opts Options
 
-	mu      sync.RWMutex
+	writes    chan writeReq
+	quit      chan struct{}
+	closeOnce sync.Once
+	done      sync.WaitGroup
+
+	mu     sync.RWMutex
+	mem    map[string]Record
+	tables []*sstable
+
 	wal     *WAL
 	walNum  uint64
-	mem     map[string]Record
 	memSize int
-	tables  []*sstable
 	nextNum uint64
 	err     error
+	batches int
+}
+
+type writeReq struct {
+	rec  Record
+	done chan error
 }
 
 func Open(dir string, opts Options) (*Store, error) {
@@ -51,11 +69,20 @@ func Open(dir string, opts Options) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	s := &Store{dir: dir, opts: opts, mem: map[string]Record{}, nextNum: 1}
+	s := &Store{
+		dir:     dir,
+		opts:    opts,
+		writes:  make(chan writeReq),
+		quit:    make(chan struct{}),
+		mem:     map[string]Record{},
+		nextNum: 1,
+	}
 	if err := s.recover(ssts, wals); err != nil {
 		s.Close()
 		return nil, err
 	}
+	s.done.Add(1)
+	go s.writeLoop()
 	return s, nil
 }
 
@@ -146,6 +173,8 @@ func (s *Store) Delete(key []byte) error {
 }
 
 func (s *Store) Close() error {
+	s.closeOnce.Do(func() { close(s.quit) })
+	s.done.Wait()
 	var errs []error
 	if s.wal != nil {
 		errs = append(errs, s.wal.Close())
@@ -157,21 +186,65 @@ func (s *Store) Close() error {
 }
 
 func (s *Store) write(rec Record) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	req := writeReq{rec: rec, done: make(chan error, 1)}
+	select {
+	case s.writes <- req:
+		return <-req.done
+	case <-s.quit:
+		return ErrClosed
+	}
+}
+
+func (s *Store) writeLoop() {
+	defer s.done.Done()
+	for {
+		select {
+		case req := <-s.writes:
+			batch := []writeReq{req}
+			for more := true; more; {
+				select {
+				case req := <-s.writes:
+					batch = append(batch, req)
+				default:
+					more = false
+				}
+			}
+			err := s.commitBatch(batch)
+			for _, req := range batch {
+				req.done <- err
+			}
+		case <-s.quit:
+			return
+		}
+	}
+}
+
+func (s *Store) commitBatch(batch []writeReq) error {
 	if s.err != nil {
 		return s.err
 	}
 	if s.memSize >= s.opts.MemtableSize {
-		if err := s.flushAndCompact(); err != nil {
+		s.mu.Lock()
+		err := s.flushAndCompact()
+		s.mu.Unlock()
+		if err != nil {
 			s.err = fmt.Errorf("storage: flush or compaction failed, store is read-only: %w", err)
 			return s.err
 		}
 	}
-	if err := s.wal.Append(rec); err != nil {
+	recs := make([]Record, len(batch))
+	for i, req := range batch {
+		recs[i] = req.rec
+	}
+	if err := s.wal.Append(recs...); err != nil {
 		return err
 	}
-	s.apply(rec)
+	s.batches++
+	s.mu.Lock()
+	for _, rec := range recs {
+		s.apply(rec)
+	}
+	s.mu.Unlock()
 	return nil
 }
 

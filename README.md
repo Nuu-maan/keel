@@ -11,6 +11,7 @@ The goal is correctness under failure first, then performance. Every durability 
 | Layer | State |
 |---|---|
 | Write-ahead log with crash recovery | Done |
+| Group commit | Done |
 | Memtable with tombstones | Done |
 | SSTables, memtable flush, WAL rotation | Done |
 | Bloom filters | Done |
@@ -48,6 +49,8 @@ flowchart TB
 ## Guarantees
 
 **Durability.** A write is acknowledged only after its WAL record has been written and `fsync`ed. An acknowledged write survives a process crash at any point.
+
+**Group commit.** One writer goroutine owns the WAL. Each `Put` or `Delete` sends its record to that goroutine and waits. The writer takes every request already queued, appends the whole batch with one `write` and one `fsync`, applies it to the memtable, and then acknowledges each caller. Durability is unchanged, because nobody is acknowledged before the `fsync` that covers their record. The store lock is held only while applying a batch or swapping in new tables, never across an `fsync`, so reads don't wait on the disk.
 
 **Fail-stop on I/O errors.** If a write or `fsync` fails, the WAL refuses every later append. After a failed `fsync` the kernel may already have dropped the dirty pages, and retrying can report success while the data is gone (see [fsyncgate](https://wiki.postgresql.org/wiki/Fsync_Errors)). Stopping is the only safe response.
 
@@ -121,6 +124,23 @@ section : offset (8) | length (4) | crc32c (4)
 - The bloom filter uses 10 bits per key and 7 probes, with double hashing over 64-bit FNV-1a. Its measured false-positive rate is 0.92%, against a theoretical 0.82%. Tombstones go into the filter too, because a delete has to be found in order to hide older values.
 - The magic number is the ASCII string `KEELSST2`.
 
+## Performance
+
+`BenchmarkPut` measures concurrent 100-byte puts, before and after group commit. The machine has 8 cores and btrfs on a device-mapper volume, and the data directory is on that disk, not tmpfs. `fsync` latency on this disk varies between about 1 and 3 ms from run to run, so each row gives the range over three interleaved runs.
+
+| Concurrent writers | Before, per write | After, per write | Speedup |
+|---|---|---|---|
+| 1 | 1.1–3.1 ms | 1.1–3.3 ms | none (bound by `fsync`) |
+| 8 | 1.1–3.2 ms | 0.61–0.80 ms | ~2–4× |
+| 128 | 1.1–3.6 ms | 18–38 µs | ~60–100× |
+| 1024 | 1.1–3.2 ms | 10–11 µs | ~100–300× |
+
+Before, throughput was capped at one write per `fsync`, a few hundred to about 900 writes per second, however many clients were writing. Afterwards it grows with concurrency, reaching roughly 95k writes per second with 1024 writers.
+
+```
+KEEL_BENCH_DIR=/path/on/real/disk go test -run '^$' -bench Put ./storage/
+```
+
 ## Testing
 
 Tests aim at failure modes, not just happy paths.
@@ -132,6 +152,7 @@ Tests aim at failure modes, not just happy paths.
 - **Compaction.** Five rounds of overwrites and deletes over 100 keys are compacted into one table. It must hold exactly the 50 live keys at their latest values, with no tombstones, and the result must survive a reopen.
 - **Torn writes and corruption.** For the WAL: partial headers, partial payloads, zero-filled tails and a damaged last record are recovered. A damaged checksum, length or payload in the middle of the file is rejected. For SSTables: damaged blocks, filter, index, footer and magic number are all detected.
 - **Filter effectiveness.** A test fills an SSTable's data blocks with garbage but leaves the filter and index intact. Lookups for absent keys still succeed, because the filter stops them before any block is read. With the filter disabled, 1999 of 2000 of those lookups read a block.
+- **Batching.** A test holds the store lock while 64 writers queue up, then checks that they all reach disk in at most 4 WAL commits. Disabling the batching loop makes it fail with 64 commits.
 - **Race detector.** CI runs the whole suite with `-race`.
 
 `SIGKILL` leaves the kernel page cache intact, so it doesn't simulate power loss. Power-loss testing is tracked in [#2](https://github.com/Nuu-maan/keel/issues/2).
@@ -153,7 +174,7 @@ storage/
 
 ## Roadmap
 
-1. **Storage engine.** Leveled compaction ([#13](https://github.com/Nuu-maan/keel/issues/13)), background flush ([#7](https://github.com/Nuu-maan/keel/issues/7)), group commit ([#1](https://github.com/Nuu-maan/keel/issues/1)).
+1. **Storage engine.** Leveled compaction ([#13](https://github.com/Nuu-maan/keel/issues/13)), background flush ([#7](https://github.com/Nuu-maan/keel/issues/7)).
 2. **Wire protocol.** Length-prefixed binary framing over TCP, with deadlines and backpressure.
 3. **Raft.** Leader election, log replication, snapshots, and linearizable reads through ReadIndex.
 4. **Chaos testing.** Process kills, `SIGSTOP`, network partitions with `iptables`, latency with `tc netem`. Recorded histories checked for linearizability with [Porcupine](https://github.com/anishathalye/porcupine).
