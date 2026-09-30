@@ -7,6 +7,7 @@ import (
 	"math/rand/v2"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -114,5 +115,90 @@ func runCrashWriter(dir string) {
 			os.Exit(1)
 		}
 		fmt.Println(key)
+	}
+}
+
+func TestStoreMatchesModelAcrossFlushesAndReopens(t *testing.T) {
+	dir := t.TempDir()
+	opts := Options{MemtableSize: 2 << 10}
+	s, err := Open(dir, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { s.Close() }()
+
+	model := map[string]string{}
+	rng := rand.New(rand.NewPCG(1, 2))
+	for i := range 5000 {
+		key := fmt.Sprintf("k%04d", rng.IntN(500))
+		if rng.IntN(4) == 0 {
+			if err := s.Delete([]byte(key)); err != nil {
+				t.Fatal(err)
+			}
+			delete(model, key)
+		} else {
+			val := fmt.Sprintf("v%d", i)
+			if err := s.Put([]byte(key), []byte(val)); err != nil {
+				t.Fatal(err)
+			}
+			model[key] = val
+		}
+		if i%1000 == 999 {
+			s.Close()
+			if s, err = Open(dir, opts); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	if len(s.tables) < 5 {
+		t.Fatalf("expected several flushes, got %d SSTables", len(s.tables))
+	}
+	for i := range 500 {
+		key := fmt.Sprintf("k%04d", i)
+		got, err := s.Get([]byte(key))
+		want, ok := model[key]
+		if !ok {
+			if !errors.Is(err, ErrNotFound) {
+				t.Fatalf("%s: want ErrNotFound, got %q, %v", key, got, err)
+			}
+			continue
+		}
+		if err != nil || string(got) != want {
+			t.Fatalf("%s = %q, %v; want %q", key, got, err, want)
+		}
+	}
+	if wals, _ := filepath.Glob(filepath.Join(dir, "*.wal")); len(wals) != 1 {
+		t.Fatalf("want exactly one live WAL, got %v", wals)
+	}
+}
+
+func TestOpenDiscardsFlushedWALs(t *testing.T) {
+	dir := t.TempDir()
+	stale, err := OpenWAL(filepath.Join(dir, "000001.wal"), func(Record) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale.Append(Record{Op: OpPut, Key: []byte("k"), Value: []byte("stale")})
+	stale.Close()
+	if err := writeSSTable(filepath.Join(dir, "000002.sst"), []Record{{Op: OpPut, Key: []byte("k"), Value: []byte("new")}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "000003.sst.tmp"), []byte("partial"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := Open(dir, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if v, err := s.Get([]byte("k")); err != nil || string(v) != "new" {
+		t.Fatalf("k = %q, %v; stale WAL was replayed over the SSTable", v, err)
+	}
+	for _, gone := range []string{"000001.wal", "000003.sst.tmp"} {
+		if _, err := os.Stat(filepath.Join(dir, gone)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("%s should have been removed, stat err = %v", gone, err)
+		}
 	}
 }
