@@ -302,3 +302,45 @@ func TestCompactionDropsOverwritesAndTombstones(t *testing.T) {
 		t.Fatalf("compaction inputs left on disk: %v", ssts)
 	}
 }
+
+func TestConcurrentWritesShareBatches(t *testing.T) {
+	s, err := Open(t.TempDir(), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	const writers = 64
+	s.mu.Lock()
+	errs := make(chan error, writers)
+	for i := range writers {
+		go func() { errs <- s.Put(fmt.Appendf(nil, "k%d", i), []byte("v")) }()
+	}
+	time.Sleep(100 * time.Millisecond)
+	s.mu.Unlock()
+	for range writers {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if s.batches > 4 {
+		t.Fatalf("%d writers took %d WAL commits, want them batched into a few", writers, s.batches)
+	}
+	for i := range writers {
+		if _, err := s.Get(fmt.Appendf(nil, "k%d", i)); err != nil {
+			t.Fatalf("k%d: %v", i, err)
+		}
+	}
+}
+
+func TestWriteAfterCloseFails(t *testing.T) {
+	s, err := Open(t.TempDir(), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	if err := s.Put([]byte("k"), []byte("v")); !errors.Is(err, ErrClosed) {
+		t.Fatalf("want ErrClosed, got %v", err)
+	}
+}
