@@ -14,7 +14,7 @@ The goal is correctness under failure first, then performance. Every durability 
 | Memtable with tombstones | Done |
 | SSTables, memtable flush, WAL rotation | Done |
 | Background flush | Planned ([#7](https://github.com/Nuu-maan/keel/issues/7)) |
-| Bloom filters | Planned ([#8](https://github.com/Nuu-maan/keel/issues/8)) |
+| Bloom filters | Done |
 | Compaction | Planned ([#9](https://github.com/Nuu-maan/keel/issues/9)) |
 | TCP wire protocol | Planned |
 | Raft replication | Planned |
@@ -79,7 +79,7 @@ Data files share one increasing sequence of numbers, so no manifest is needed fo
 
 A flush error of any kind makes the store read-only. Once `N.sst` exists, the old WAL counts as flushed, so appending to it again would lose writes.
 
-**Reads.** `Get` checks the memtable first, then SSTables from newest to oldest, and stops at the first match. A tombstone means the key is deleted, even if an older table still holds a value.
+**Reads.** `Get` checks the memtable first, then SSTables from newest to oldest, and stops at the first match. A tombstone means the key is deleted, even if an older table still holds a value. Each SSTable's bloom filter is checked before its index, so for a key the table doesn't contain, about 99% of lookups skip the disk read entirely.
 
 ## On-disk format
 
@@ -98,16 +98,19 @@ payload : op (1) | key len (uvarint) | key | value
 ### SSTable
 
 ```
-file   : block* | index | footer
-block  : entry* | crc32c (4)                               closed at ~4 KiB
-entry  : key len (uvarint) | key | op (1) | value len (uvarint) | value
-index  : { last key len (uvarint) | last key | offset (uvarint) | length (uvarint) } per block
-footer : index offset (8) | index len (4) | index crc32c (4) | magic (8)
+file    : block* | filter | index | footer
+block   : entry* | crc32c (4)                               closed at ~4 KiB
+entry   : key len (uvarint) | key | op (1) | value len (uvarint) | value
+filter  : bloom bits | probe count (1)
+index   : { last key len (uvarint) | last key | offset (uvarint) | length (uvarint) } per block
+footer  : filter section | index section | magic (8)
+section : offset (8) | length (4) | crc32c (4)
 ```
 
 - Entries are sorted by key and appear at most once per table.
-- The index is loaded into memory when the table is opened. A lookup binary-searches it for the first block whose last key is at or above the target, then reads that single block with `pread`.
-- The magic number is the ASCII string `KEELSST1`.
+- The filter and index are loaded into memory when the table is opened. A lookup checks the filter, then binary-searches the index for the first block whose last key is at or above the target, and reads that single block with `pread`.
+- The bloom filter uses 10 bits per key and 7 probes, with double hashing over 64-bit FNV-1a. Its measured false-positive rate is 0.92%, against a theoretical 0.82%. Tombstones go into the filter too, because a delete has to be found in order to hide older values.
+- The magic number is the ASCII string `KEELSST2`.
 
 ## Testing
 
@@ -117,7 +120,8 @@ Tests aim at failure modes, not just happy paths.
 - **Mutation-checked.** Each durability test has been seen to fail against a deliberately broken store. Skipping WAL appends, replaying flushed WALs, deleting the live WAL and ignoring tombstones are each caught. A durability test that can't fail proves nothing.
 - **Model-based.** 5000 random puts and deletes on a small memtable, so the run goes through many flushes and several reopens. Afterwards every key is checked against a plain Go map.
 - **Recovery rules.** A test plants a stale WAL under a newer SSTable, plus a half-written `.tmp` file, and checks that opening the store deletes both and doesn't replay the stale values.
-- **Torn writes and corruption.** For the WAL: partial headers, partial payloads, zero-filled tails and a damaged last record are recovered. A damaged checksum, length or payload in the middle of the file is rejected. For SSTables: damaged blocks, index, footer and magic number are all detected.
+- **Torn writes and corruption.** For the WAL: partial headers, partial payloads, zero-filled tails and a damaged last record are recovered. A damaged checksum, length or payload in the middle of the file is rejected. For SSTables: damaged blocks, filter, index, footer and magic number are all detected.
+- **Filter effectiveness.** A test fills an SSTable's data blocks with garbage but leaves the filter and index intact. Lookups for absent keys still succeed, because the filter stops them before any block is read. With the filter disabled, 1999 of 2000 of those lookups read a block.
 - **Race detector.** CI runs the whole suite with `-race`.
 
 `SIGKILL` leaves the kernel page cache intact, so it doesn't simulate power loss. Power-loss testing is tracked in [#2](https://github.com/Nuu-maan/keel/issues/2).
@@ -131,13 +135,14 @@ go test -race ./...
 ```
 storage/
   wal.go       write-ahead log: record format, append, replay, torn-tail recovery
-  sstable.go   SSTable writer and reader: blocks, index, footer
+  sstable.go   SSTable writer and reader: blocks, filter, index, footer
+  bloom.go     bloom filter
   store.go     memtable, flush, WAL rotation, recovery, read path
 ```
 
 ## Roadmap
 
-1. **Storage engine.** Bloom filters ([#8](https://github.com/Nuu-maan/keel/issues/8)), compaction ([#9](https://github.com/Nuu-maan/keel/issues/9)), background flush ([#7](https://github.com/Nuu-maan/keel/issues/7)), group commit ([#1](https://github.com/Nuu-maan/keel/issues/1)).
+1. **Storage engine.** Compaction ([#9](https://github.com/Nuu-maan/keel/issues/9)), background flush ([#7](https://github.com/Nuu-maan/keel/issues/7)), group commit ([#1](https://github.com/Nuu-maan/keel/issues/1)).
 2. **Wire protocol.** Length-prefixed binary framing over TCP, with deadlines and backpressure.
 3. **Raft.** Leader election, log replication, snapshots, and linearizable reads through ReadIndex.
 4. **Chaos testing.** Process kills, `SIGSTOP`, network partitions with `iptables`, latency with `tc netem`. Recorded histories checked for linearizability with [Porcupine](https://github.com/anishathalye/porcupine).
