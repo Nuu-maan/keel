@@ -55,6 +55,8 @@ func TestStoreCopiesValues(t *testing.T) {
 
 const crashDirEnv = "KEEL_CRASH_DIR"
 
+var crashOpts = Options{MemtableSize: 4 << 10}
+
 func TestCrashRecovery(t *testing.T) {
 	if dir := os.Getenv(crashDirEnv); dir != "" {
 		runCrashWriter(dir)
@@ -64,7 +66,7 @@ func TestCrashRecovery(t *testing.T) {
 	for round := range 20 {
 		acked := killWriterAfter(t, dir, 1+rand.IntN(300))
 
-		s, err := Open(dir, Options{})
+		s, err := Open(dir, crashOpts)
 		if err != nil {
 			t.Fatalf("round %d: reopen: %v", round, err)
 		}
@@ -74,6 +76,9 @@ func TestCrashRecovery(t *testing.T) {
 			}
 		}
 		s.Close()
+	}
+	if ssts, _ := filepath.Glob(filepath.Join(dir, "*.sst")); len(ssts) == 0 {
+		t.Fatal("writer never flushed, so crashes during flush were not exercised")
 	}
 }
 
@@ -102,7 +107,7 @@ func killWriterAfter(t *testing.T, dir string, acks int) []string {
 }
 
 func runCrashWriter(dir string) {
-	s, err := Open(dir, Options{})
+	s, err := Open(dir, crashOpts)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
