@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"hash/crc32"
 	"os"
-	"path/filepath"
 	"sort"
 )
 
@@ -17,28 +16,7 @@ const (
 )
 
 func writeSSTable(path string, recs []Record) error {
-	tmp := path + ".tmp"
-	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
-	if err != nil {
-		return err
-	}
-	_, err = f.Write(encodeSSTable(recs))
-	if err == nil {
-		err = f.Sync()
-	}
-	if closeErr := f.Close(); err == nil {
-		err = closeErr
-	}
-	if err == nil {
-		err = os.Rename(tmp, path)
-	}
-	if err == nil {
-		err = syncDir(filepath.Dir(path))
-	}
-	if err != nil {
-		os.Remove(tmp)
-	}
-	return err
+	return writeFileAtomic(path, encodeSSTable(recs))
 }
 
 func encodeSSTable(recs []Record) []byte {
