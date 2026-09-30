@@ -55,7 +55,7 @@ func TestStoreCopiesValues(t *testing.T) {
 
 const crashDirEnv = "KEEL_CRASH_DIR"
 
-var crashOpts = Options{MemtableSize: 4 << 10}
+var crashOpts = Options{MemtableSize: 4 << 10, CompactionTrigger: 3}
 
 func TestCrashRecovery(t *testing.T) {
 	if dir := os.Getenv(crashDirEnv); dir != "" {
@@ -77,8 +77,13 @@ func TestCrashRecovery(t *testing.T) {
 		}
 		s.Close()
 	}
-	if ssts, _ := filepath.Glob(filepath.Join(dir, "*.sst")); len(ssts) == 0 {
-		t.Fatal("writer never flushed, so crashes during flush were not exercised")
+	s, err := Open(dir, crashOpts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if s.nextNum < 20 {
+		t.Fatalf("only %d files ever created, so crashes during flush and compaction were barely exercised", s.nextNum)
 	}
 }
 
