@@ -49,15 +49,17 @@ flowchart TB
 
 **Fail-stop on I/O errors.** If a write or `fsync` fails, the WAL refuses every later append. After a failed `fsync` the kernel may already have dropped the dirty pages, and retrying can report success while the data is gone (see [fsyncgate](https://wiki.postgresql.org/wiki/Fsync_Errors)). Stopping is the only safe response.
 
-**Corruption is detected, not ignored.** Every record carries a CRC32C checksum. On recovery:
+**Corruption is detected, not ignored.** Each WAL record has two CRC32C checksums, one for the header and one for the payload. The header checksum means a damaged length field is caught before the length is used.
+
+A crash leaves at most a prefix of the last record, possibly followed by zeros where the filesystem extended the file. Recovery tells that apart from real damage:
 
 | What replay finds | Action |
 |---|---|
-| Partial header or payload at end of file | Torn write from a crash; truncate it |
-| Bad checksum on the last record | Torn write from a crash; truncate it |
-| Bad checksum with more data after it | Real corruption; refuse to open with `ErrCorrupt` |
+| Fewer than 12 bytes left, or a valid header whose payload runs past the end of the file | Torn write; truncate it |
+| Bad header or payload checksum, and every byte after it is zero | Torn write; truncate it |
+| Bad header or payload checksum, and non-zero data after it | Corruption; refuse to open with `ErrCorrupt` |
 
-Known gap: a corrupted length field in the middle of the file is currently treated as a torn tail ([#3](https://github.com/Nuu-maan/keel/issues/3)).
+Truncating at real corruption would silently drop the acknowledged writes that follow it, so the store refuses to open instead.
 
 SSTables are checked the same way. The footer, the index and every data block carry a CRC32C checksum, and a mismatch fails the read with `ErrCorrupt` instead of returning bad data.
 
@@ -84,13 +86,12 @@ A flush error of any kind makes the store read-only. Once `N.sst` exists, the ol
 ### WAL record
 
 ```
-+------------+------------+--------+------------------+---------+-----------+
-| crc32c (4) | length (4) | op (1) | key len (uvarint) |   key   |   value   |
-+------------+------------+--------+------------------+---------+-----------+
-             |<------------------------ length bytes ------------------------>|
+record  : header (12) | payload
+header  : payload crc32c (4) | payload length (4) | header crc32c (4)
+payload : op (1) | key len (uvarint) | key | value
 ```
 
-- Integers are little-endian. The checksum uses the Castagnoli polynomial and covers everything after the header.
+- Integers are little-endian. Checksums use the Castagnoli polynomial. The header checksum covers the first 8 header bytes, and the payload checksum covers the payload.
 - `op` is `1` for put and `2` for delete.
 - The value takes up the rest of the payload, so it has no length prefix of its own.
 
@@ -116,7 +117,7 @@ Tests aim at failure modes, not just happy paths.
 - **Mutation-checked.** Each durability test has been seen to fail against a deliberately broken store. Skipping WAL appends, replaying flushed WALs, deleting the live WAL and ignoring tombstones are each caught. A durability test that can't fail proves nothing.
 - **Model-based.** 5000 random puts and deletes on a small memtable, so the run goes through many flushes and several reopens. Afterwards every key is checked against a plain Go map.
 - **Recovery rules.** A test plants a stale WAL under a newer SSTable, plus a half-written `.tmp` file, and checks that opening the store deletes both and doesn't replay the stale values.
-- **Torn writes and corruption.** For the WAL: partial headers, partial payloads and bad checksums at the tail are recovered, and corruption in the middle of the file is rejected. For SSTables: damaged blocks, index, footer and magic number are all detected.
+- **Torn writes and corruption.** For the WAL: partial headers, partial payloads, zero-filled tails and a damaged last record are recovered. A damaged checksum, length or payload in the middle of the file is rejected. For SSTables: damaged blocks, index, footer and magic number are all detected.
 - **Race detector.** CI runs the whole suite with `-race`.
 
 `SIGKILL` leaves the kernel page cache intact, so it doesn't simulate power loss. Power-loss testing is tracked in [#2](https://github.com/Nuu-maan/keel/issues/2).
