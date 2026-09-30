@@ -149,11 +149,15 @@ func tornOrCorrupt(f *os.File, off, from, size int64) (int64, error) {
 
 // After a failed write or fsync the on-disk state is unknown (a retried fsync can
 // report success while data is lost), so the WAL refuses all further appends.
-func (w *WAL) Append(rec Record) error {
+func (w *WAL) Append(recs ...Record) error {
 	if w.err != nil {
 		return w.err
 	}
-	if _, err := w.f.Write(encode(rec)); err != nil {
+	var buf []byte
+	for _, rec := range recs {
+		buf = append(buf, encode(rec)...)
+	}
+	if _, err := w.f.Write(buf); err != nil {
 		w.err = err
 		return err
 	}

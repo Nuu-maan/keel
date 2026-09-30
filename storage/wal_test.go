@@ -47,6 +47,27 @@ func TestWALRoundTrip(t *testing.T) {
 	}
 }
 
+func TestWALAppendsBatches(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "wal.log")
+	w, err := OpenWAL(path, func(Record) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = w.Append(
+		Record{Op: OpPut, Key: []byte("a"), Value: []byte("1")},
+		Record{Op: OpDelete, Key: []byte("b")},
+		Record{Op: OpPut, Key: []byte("c"), Value: []byte("3")},
+	)
+	w.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := replayAll(path)
+	if err != nil || len(got) != 3 || string(got[0].Key) != "a" || got[1].Op != OpDelete || string(got[2].Value) != "3" {
+		t.Fatalf("replay = %+v, %v", got, err)
+	}
+}
+
 func TestWALTruncatesTornTail(t *testing.T) {
 	for name, tail := range map[string][]byte{
 		"partial header":              {0x01, 0x02, 0x03},
