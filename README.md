@@ -28,7 +28,8 @@ The goal is correctness under failure first, then performance. Every durability 
 ## Quick start
 
 ```
-go build ./cmd/keeld ./cmd/keelctl
+go build -o keeld ./cmd/keeld
+go build -o keelctl ./cmd/keelctl
 
 ./keeld -addr 127.0.0.1:7070 -dir data &
 ./keelctl put greeting "hello keel"
