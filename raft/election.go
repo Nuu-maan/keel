@@ -106,6 +106,7 @@ func Open(dir string, cfg Config) (*Node, error) {
 			err = n.persist(n.state)
 		}
 	case err == nil:
+		n.state = hardState{}
 		err = json.Unmarshal(data, &n.state)
 	}
 	if err == nil && (n.state.ID != cfg.ID || !slices.Equal(n.state.Members, cfg.Members) ||
