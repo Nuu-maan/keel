@@ -42,6 +42,7 @@ type Config struct {
 	ElectionTicks, HeartbeatTicks int
 	// These must describe the caller's recovered durable log, not uncommitted memory.
 	LastLogIndex, LastLogTerm uint64
+	Apply                     func(Command) error
 }
 
 type Status struct {
@@ -50,9 +51,9 @@ type Status struct {
 }
 
 type hardState struct {
-	ID             uint64
-	Members        []uint64
-	Term, VotedFor uint64
+	ID                     uint64
+	Members                []uint64
+	Term, VotedFor, Commit uint64
 }
 
 type Node struct {
@@ -60,6 +61,8 @@ type Node struct {
 	config           Config
 	state            hardState
 	store            *storage.Store
+	log              []Entry
+	applied          uint64
 	role             Role
 	leader           uint64
 	votes            map[uint64]bool
@@ -118,6 +121,14 @@ func Open(dir string, cfg Config) (*Node, error) {
 		s.Close()
 		return nil, err
 	}
+	if err := n.loadLog(); err != nil {
+		s.Close()
+		return nil, err
+	}
+	if err := n.applyCommitted(); err != nil {
+		s.Close()
+		return nil, err
+	}
 	n.resetTimeout()
 	return n, nil
 }
@@ -170,7 +181,7 @@ func (n *Node) Tick() ([]Message, error) {
 	n.votes = map[uint64]bool{n.config.ID: true}
 	n.resetTimeout()
 	if n.hasMajority() {
-		return n.becomeLeader(), nil
+		return n.becomeLeader()
 	}
 	return n.broadcast(RequestVote), nil
 }
@@ -211,7 +222,7 @@ func (n *Node) Step(m Message) ([]Message, error) {
 		if m.Term == n.state.Term && n.role == Candidate && m.Granted {
 			n.votes[m.From] = true
 			if n.hasMajority() {
-				return n.becomeLeader(), nil
+				return n.becomeLeader()
 			}
 		}
 	case Heartbeat:
@@ -252,10 +263,13 @@ func (n *Node) resetTimeout() {
 
 func (n *Node) hasMajority() bool { return len(n.votes) > len(n.config.Members)/2 }
 
-func (n *Node) becomeLeader() []Message {
+func (n *Node) becomeLeader() ([]Message, error) {
+	if _, err := n.appendEntry(Command{}); err != nil {
+		return nil, err
+	}
 	n.role, n.leader, n.elapsed = Leader, n.config.ID, 0
 	n.votes = nil
-	return n.broadcast(Heartbeat)
+	return n.broadcast(Heartbeat), nil
 }
 
 func (n *Node) broadcast(kind MessageType) []Message {
