@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Nuu-maan/keel/client"
 	"github.com/Nuu-maan/keel/storage"
 	"github.com/Nuu-maan/keel/wire"
 )
@@ -17,8 +18,14 @@ type Options struct {
 	WriteTimeout time.Duration
 }
 
+type Store interface {
+	Get([]byte) ([]byte, error)
+	Put([]byte, []byte) error
+	Delete([]byte) error
+}
+
 type Server struct {
-	store *storage.Store
+	store Store
 	opts  Options
 
 	mu       sync.Mutex
@@ -28,7 +35,7 @@ type Server struct {
 	handlers sync.WaitGroup
 }
 
-func New(store *storage.Store, opts Options) *Server {
+func New(store Store, opts Options) *Server {
 	if opts.MaxInFlight <= 0 {
 		opts.MaxInFlight = 256
 	}
@@ -162,7 +169,7 @@ func (s *Server) execute(req wire.Request) wire.Response {
 	switch {
 	case err == nil:
 		return wire.Response{ID: req.ID, Status: wire.StatusOK, Value: value}
-	case errors.Is(err, storage.ErrNotFound):
+	case errors.Is(err, storage.ErrNotFound) || errors.Is(err, client.ErrNotFound):
 		return wire.Response{ID: req.ID, Status: wire.StatusNotFound}
 	default:
 		return wire.Response{ID: req.ID, Status: wire.StatusError, Value: []byte(err.Error())}
