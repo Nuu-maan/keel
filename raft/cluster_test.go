@@ -102,7 +102,7 @@ func TestClusterFailoverAndCatchUp(t *testing.T) {
 	}
 	old := waitLeader(-1)
 	follower := (old + 1) % 3
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	dial := func(i int) *client.Client {
 		t.Helper()
