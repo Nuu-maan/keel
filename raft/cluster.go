@@ -3,13 +3,17 @@ package raft
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -24,6 +28,12 @@ type Peer struct {
 	RaftAddr, ClientAddr string
 }
 
+type ClusterOptions struct {
+	Tick          time.Duration
+	ElectionTicks int
+	PeerTimeout   time.Duration
+}
+
 type Cluster struct {
 	mu          sync.Mutex
 	peerMu      sync.Mutex
@@ -31,16 +41,31 @@ type Cluster struct {
 	app         *storage.Store
 	peers       map[uint64]Peer
 	httpClient  *http.Client
+	serverTLS   *tls.Config
+	secure      bool
 	server      *http.Server
-	listener    net.Listener
+	errors      chan error
 	stop        chan struct{}
 	done        chan struct{}
 	leaderTerm  uint64
 	next, match map[uint64]uint64
 	closed      bool
+	tick        time.Duration
 }
 
-func OpenCluster(dir string, id uint64, peers map[uint64]Peer, app *storage.Store) (*Cluster, error) {
+func OpenCluster(dir string, id uint64, peers map[uint64]Peer, app *storage.Store, opts ClusterOptions) (*Cluster, error) {
+	if opts.Tick == 0 {
+		opts.Tick = 100 * time.Millisecond
+	}
+	if opts.ElectionTicks == 0 {
+		opts.ElectionTicks = 10
+	}
+	if opts.PeerTimeout == 0 {
+		opts.PeerTimeout = 500 * time.Millisecond
+	}
+	if opts.Tick < time.Millisecond || opts.PeerTimeout < time.Millisecond {
+		return nil, errors.New("raft: invalid timing options")
+	}
 	if app == nil || len(peers) == 0 {
 		return nil, errors.New("raft: missing application store or peers")
 	}
@@ -63,11 +88,54 @@ func OpenCluster(dir string, id uint64, peers map[uint64]Peer, app *storage.Stor
 		}
 		return nil
 	}
-	node, err := Open(dir, Config{ID: id, Members: members, Apply: apply})
+	restore := func(image map[string][]byte) error {
+		current, err := app.Snapshot()
+		if err != nil {
+			return err
+		}
+		for key := range current {
+			if _, ok := image[key]; !ok {
+				if err := app.Delete([]byte(key)); err != nil {
+					return err
+				}
+			}
+		}
+		for key, value := range image {
+			if err := app.Put([]byte(key), value); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	node, err := Open(dir, Config{ID: id, Members: members, ElectionTicks: opts.ElectionTicks, Apply: apply, Restore: restore})
 	if err != nil {
 		return nil, err
 	}
-	return &Cluster{node: node, app: app, peers: ownPeers, httpClient: &http.Client{Timeout: 500 * time.Millisecond}, stop: make(chan struct{}), done: make(chan struct{}), next: map[uint64]uint64{}, match: map[uint64]uint64{}}, nil
+	return &Cluster{node: node, app: app, peers: ownPeers, httpClient: &http.Client{Timeout: opts.PeerTimeout}, stop: make(chan struct{}), done: make(chan struct{}), errors: make(chan error, 1), next: map[uint64]uint64{}, match: map[uint64]uint64{}, tick: opts.Tick}, nil
+}
+
+func (c *Cluster) EnableTLS(certFile, keyFile, caFile string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.server != nil || c.closed {
+		return errors.New("raft: TLS must be configured before start")
+	}
+	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		return err
+	}
+	ca, err := os.ReadFile(caFile)
+	if err != nil {
+		return err
+	}
+	roots := x509.NewCertPool()
+	if !roots.AppendCertsFromPEM(ca) {
+		return errors.New("raft: invalid peer CA")
+	}
+	c.serverTLS = &tls.Config{MinVersion: tls.VersionTLS13, Certificates: []tls.Certificate{cert}, ClientCAs: roots, ClientAuth: tls.RequireAndVerifyClientCert}
+	c.httpClient.Transport = &http.Transport{TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS13, RootCAs: roots, Certificates: []tls.Certificate{cert}}}
+	c.secure = true
+	return nil
 }
 
 func (c *Cluster) Start(ln net.Listener) error {
@@ -77,12 +145,31 @@ func (c *Cluster) Start(ln net.Listener) error {
 		ln.Close()
 		return errors.New("raft: cluster already started or closed")
 	}
-	c.listener = ln
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /vote", c.handleVote)
 	mux.HandleFunc("POST /append", c.handleAppend)
+	mux.HandleFunc("POST /snapshot", c.handleSnapshot)
 	c.server = &http.Server{Handler: mux, ReadHeaderTimeout: 2 * time.Second}
-	go func() { c.server.Serve(ln) }()
+	if !c.secure {
+		for _, p := range c.peers {
+			host, _, err := net.SplitHostPort(p.RaftAddr)
+			if err != nil || (host != "localhost" && !net.ParseIP(strings.Trim(host, "[]")).IsLoopback()) {
+				ln.Close()
+				c.server = nil
+				return errors.New("raft: non-loopback peers require TLS")
+			}
+		}
+	} else {
+		ln = tls.NewListener(ln, c.serverTLS)
+	}
+	go func() {
+		if err := c.server.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			select {
+			case c.errors <- err:
+			default:
+			}
+		}
+	}()
 	go c.run()
 	return nil
 }
@@ -98,17 +185,22 @@ func (c *Cluster) Close() error {
 	srv := c.server
 	c.mu.Unlock()
 	if srv != nil {
-		srv.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		if err := srv.Shutdown(ctx); err != nil {
+			srv.Close()
+		}
+		cancel()
 		<-c.done
 	}
 	return c.node.Close()
 }
 
-func (c *Cluster) Status() Status { return c.node.Status() }
+func (c *Cluster) Status() Status       { return c.node.Status() }
+func (c *Cluster) Errors() <-chan error { return c.errors }
 
 func (c *Cluster) run() {
 	defer close(c.done)
-	ticker := time.NewTicker(100 * time.Millisecond)
+	ticker := time.NewTicker(c.tick)
 	defer ticker.Stop()
 	for {
 		select {
@@ -117,7 +209,15 @@ func (c *Cluster) run() {
 		case <-ticker.C:
 			c.mu.Lock()
 			messages, err := c.node.Tick()
-			if err == nil {
+			if err != nil {
+				select {
+				case c.errors <- err:
+				default:
+				}
+				c.mu.Unlock()
+				return
+			}
+			{
 				for _, m := range messages {
 					if m.Type != RequestVote {
 						continue
@@ -141,9 +241,13 @@ func (c *Cluster) post(id uint64, route string, request, reply any) error {
 	if err != nil {
 		return err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), c.httpClient.Timeout)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://"+c.peers[id].RaftAddr+"/"+route, bytes.NewReader(data))
+	scheme := "http://"
+	if c.secure {
+		scheme = "https://"
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, scheme+c.peers[id].RaftAddr+"/"+route, bytes.NewReader(data))
 	if err != nil {
 		return err
 	}
@@ -204,6 +308,19 @@ func (c *Cluster) handleAppend(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(res)
 }
 
+func (c *Cluster) handleSnapshot(w http.ResponseWriter, r *http.Request) {
+	var req InstallRequest
+	if !decodeRPC(w, r, &req) {
+		return
+	}
+	res, err := c.node.Install(req)
+	if err != nil {
+		http.Error(w, "snapshot rejected", http.StatusBadRequest)
+		return
+	}
+	json.NewEncoder(w).Encode(res)
+}
+
 func (c *Cluster) replicatePeer(id uint64, term uint64) bool {
 	for attempts := 0; attempts < 256; attempts++ {
 		current, commit, last := c.node.LogInfo()
@@ -219,11 +336,36 @@ func (c *Cluster) replicatePeer(id uint64, term uint64) bool {
 		if index > last+1 {
 			index = last + 1
 		}
+		c.node.mu.Lock()
+		base := c.node.snapshot.Index
+		c.node.mu.Unlock()
+		if index <= base {
+			snap, err := c.node.SnapshotForPeer()
+			if err != nil {
+				return false
+			}
+			var res AppendResponse
+			if err := c.post(id, "snapshot", InstallRequest{From: c.node.Status().ID, To: id, Term: term, Snapshot: snap}, &res); err != nil {
+				return false
+			}
+			if res.Term > term {
+				c.node.Step(Message{Type: HeartbeatResponse, From: id, To: c.node.Status().ID, Term: res.Term})
+				return false
+			}
+			if !res.Success || res.Term != term || res.From != id {
+				return false
+			}
+			c.peerMu.Lock()
+			c.match[id] = max(c.match[id], res.MatchIndex)
+			c.next[id] = res.MatchIndex + 1
+			c.peerMu.Unlock()
+			continue
+		}
 		prev, entries, err := c.node.EntriesFrom(index, 8)
 		if err != nil {
 			return false
 		}
-		req := AppendRequest{From: c.node.Status().ID, Term: term, PrevIndex: index - 1, PrevTerm: prev, LeaderCommit: commit, Entries: entries}
+		req := AppendRequest{From: c.node.Status().ID, To: id, Term: term, PrevIndex: index - 1, PrevTerm: prev, LeaderCommit: commit, Entries: entries}
 		var res AppendResponse
 		if err := c.post(id, "append", req, &res); err != nil {
 			return false
@@ -232,7 +374,7 @@ func (c *Cluster) replicatePeer(id uint64, term uint64) bool {
 			c.node.Step(Message{Type: HeartbeatResponse, From: id, To: req.From, Term: res.Term})
 			return false
 		}
-		if res.Term != term {
+		if res.Term != term || res.From != id {
 			return false
 		}
 		if !res.Success {
@@ -296,11 +438,19 @@ func (c *Cluster) replicateAll() (bool, error) {
 	_, commit, _ := c.node.LogInfo()
 	if candidate > commit {
 		c.node.mu.Lock()
-		currentTerm := c.node.log[candidate-1].Term == term
+		currentTerm := c.node.termAt(candidate) == term
 		c.node.mu.Unlock()
 		if currentTerm {
 			if err := c.node.Commit(candidate); err != nil {
 				return false, err
+			}
+			c.node.mu.Lock()
+			due := c.node.state.Commit-c.node.snapshot.Index >= 128
+			c.node.mu.Unlock()
+			if due {
+				if err := c.node.CreateSnapshot(); err != nil {
+					return false, err
+				}
 			}
 		}
 	}
@@ -308,7 +458,14 @@ func (c *Cluster) replicateAll() (bool, error) {
 }
 
 func (c *Cluster) submit(cmd Command) error {
+	if len(cmd.Key)+len(cmd.Value) > 1<<20 {
+		return errors.New("raft: command exceeds 1 MiB")
+	}
 	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return storage.ErrClosed
+	}
 	if c.node.Status().Role != Leader {
 		c.mu.Unlock()
 		return c.forward(cmd, nil)
@@ -334,6 +491,10 @@ func (c *Cluster) Delete(key []byte) error { return c.submit(Command{Op: Delete,
 
 func (c *Cluster) Get(key []byte) ([]byte, error) {
 	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return nil, storage.ErrClosed
+	}
 	if c.node.Status().Role != Leader {
 		c.mu.Unlock()
 		var value []byte
@@ -347,7 +508,7 @@ func (c *Cluster) Get(key []byte) ([]byte, error) {
 	if err == nil {
 		term, commit, _ := c.node.LogInfo()
 		c.node.mu.Lock()
-		ready := commit > 0 && c.node.log[commit-1].Term == term
+		ready := commit > 0 && c.node.termAt(commit) == term
 		c.node.mu.Unlock()
 		if !ready {
 			err = ErrNoQuorum
@@ -379,6 +540,9 @@ func (c *Cluster) forward(cmd Command, value *[]byte) error {
 	defer conn.Close()
 	if value != nil {
 		*value, err = conn.Get(ctx, cmd.Key)
+		if errors.Is(err, client.ErrNotFound) {
+			return storage.ErrNotFound
+		}
 		return err
 	}
 	if cmd.Op == Put {
