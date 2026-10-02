@@ -7,7 +7,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Nuu-maan/keel/client"
 	"github.com/Nuu-maan/keel/storage"
 	"github.com/Nuu-maan/keel/wire"
 )
@@ -169,7 +168,7 @@ func (s *Server) execute(req wire.Request) wire.Response {
 	switch {
 	case err == nil:
 		return wire.Response{ID: req.ID, Status: wire.StatusOK, Value: value}
-	case errors.Is(err, storage.ErrNotFound) || errors.Is(err, client.ErrNotFound):
+	case errors.Is(err, storage.ErrNotFound):
 		return wire.Response{ID: req.ID, Status: wire.StatusNotFound}
 	default:
 		return wire.Response{ID: req.ID, Status: wire.StatusError, Value: []byte(err.Error())}

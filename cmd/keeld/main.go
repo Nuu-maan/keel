@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/Nuu-maan/keel/raft"
 	"github.com/Nuu-maan/keel/server"
@@ -23,9 +24,15 @@ func main() {
 	dir := flag.String("dir", "data", "data directory")
 	id := flag.Uint64("id", 0, "Raft node ID; zero keeps standalone mode")
 	peerAddr := flag.String("peer-addr", "", "Raft peer listen address")
+	peerCert := flag.String("peer-cert", "", "peer TLS certificate")
+	peerKey := flag.String("peer-key", "", "peer TLS private key")
+	peerCA := flag.String("peer-ca", "", "peer TLS CA certificate")
+	tick := flag.Duration("raft-tick", 100*time.Millisecond, "Raft timer tick")
+	electionTicks := flag.Int("election-ticks", 10, "minimum election timeout in Raft ticks")
+	peerTimeout := flag.Duration("peer-timeout", 500*time.Millisecond, "peer RPC timeout")
 	peers := flag.String("peers", "", "comma-separated id=raft-addr@client-addr entries")
 	flag.Parse()
-	if err := run(*addr, *dir, *id, *peerAddr, *peers); err != nil {
+	if err := run(*addr, *dir, *id, *peerAddr, *peers, *peerCert, *peerKey, *peerCA, raft.ClusterOptions{Tick: *tick, ElectionTicks: *electionTicks, PeerTimeout: *peerTimeout}); err != nil {
 		slog.Error("keeld stopped", "err", err)
 		os.Exit(1)
 	}
@@ -57,8 +64,8 @@ func parsePeers(spec string) (map[uint64]raft.Peer, error) {
 	return peers, nil
 }
 
-func run(addr, dir string, id uint64, peerAddr, peerSpec string) error {
-	if id == 0 && (peerAddr != "" || peerSpec != "") {
+func run(addr, dir string, id uint64, peerAddr, peerSpec, peerCert, peerKey, peerCA string, opts raft.ClusterOptions) error {
+	if id == 0 && (peerAddr != "" || peerSpec != "" || peerCert != "" || peerKey != "" || peerCA != "") {
 		return errors.New("-id is required for cluster mode")
 	}
 	var store *storage.Store
@@ -72,6 +79,16 @@ func run(addr, dir string, id uint64, peerAddr, peerSpec string) error {
 		}
 		service = store
 	} else {
+		entries, readErr := os.ReadDir(dir)
+		if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
+			return readErr
+		}
+		for _, entry := range entries {
+			name := entry.Name()
+			if name == "MANIFEST" || strings.HasSuffix(name, ".wal") || strings.HasSuffix(name, ".sst") {
+				return errors.New("standalone data directory cannot be opened in cluster mode")
+			}
+		}
 		peers, err := parsePeers(peerSpec)
 		if err != nil {
 			return err
@@ -84,10 +101,22 @@ func run(addr, dir string, id uint64, peerAddr, peerSpec string) error {
 		if err != nil {
 			return err
 		}
-		cluster, err = raft.OpenCluster(filepath.Join(dir, "raft"), id, peers, store)
+		cluster, err = raft.OpenCluster(filepath.Join(dir, "raft"), id, peers, store, opts)
 		if err != nil {
 			store.Close()
 			return err
+		}
+		if peerCert != "" || peerKey != "" || peerCA != "" {
+			if peerCert == "" || peerKey == "" || peerCA == "" {
+				cluster.Close()
+				store.Close()
+				return errors.New("all peer TLS files are required")
+			}
+			if err := cluster.EnableTLS(peerCert, peerKey, peerCA); err != nil {
+				cluster.Close()
+				store.Close()
+				return err
+			}
 		}
 		service = cluster
 	}
@@ -124,5 +153,15 @@ func run(addr, dir string, id uint64, peerAddr, peerSpec string) error {
 	case err := <-serveErr:
 		srv.Close()
 		return err
+	case err := <-clusterErrors(cluster):
+		srv.Close()
+		return err
 	}
+}
+
+func clusterErrors(c *raft.Cluster) <-chan error {
+	if c == nil {
+		return nil
+	}
+	return c.Errors()
 }
