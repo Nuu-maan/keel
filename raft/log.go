@@ -77,7 +77,7 @@ func (n *Node) loadLog() error {
 	}
 	prev := n.snapshot.Term
 	for i, e := range n.log {
-		if e.Term < prev || e.Term > n.state.Term || e.Command.Op > Delete || (e.Command.Op != Noop && len(e.Command.Key) == 0) || (e.Command.Op == Noop && (len(e.Command.Key) != 0 || len(e.Command.Value) != 0)) || (e.Command.Op == Delete && len(e.Command.Value) != 0) || len(e.Command.Key)+len(e.Command.Value) > 1<<20 {
+		if e.Term < prev || e.Term > n.state.Term || e.Command.Op > Delete || (e.Command.Op == Noop && (len(e.Command.Key) != 0 || len(e.Command.Value) != 0)) || (e.Command.Op == Delete && len(e.Command.Value) != 0) || len(e.Command.Key)+len(e.Command.Value) > 1<<20 {
 			return fmt.Errorf("raft: invalid log entry %d", n.snapshot.Index+uint64(i)+1)
 		}
 		prev = e.Term
@@ -105,7 +105,7 @@ func (n *Node) failWrite(err error) error {
 }
 
 func (n *Node) appendEntry(cmd Command) (uint64, error) {
-	if cmd.Op > Delete || (cmd.Op != Noop && len(cmd.Key) == 0) || len(cmd.Key)+len(cmd.Value) > 1<<20 {
+	if cmd.Op > Delete || len(cmd.Key)+len(cmd.Value) > 1<<20 {
 		return 0, errors.New("raft: invalid command")
 	}
 	cmd.Key, cmd.Value = bytes.Clone(cmd.Key), bytes.Clone(cmd.Value)
@@ -140,7 +140,7 @@ func (n *Node) Append(req AppendRequest) (AppendResponse, error) {
 	}
 	previousTerm := req.PrevTerm
 	for _, e := range req.Entries {
-		if e.Term < previousTerm || e.Term > req.Term || e.Command.Op > Delete || (e.Command.Op != Noop && len(e.Command.Key) == 0) || (e.Command.Op == Noop && (len(e.Command.Key) != 0 || len(e.Command.Value) != 0)) || (e.Command.Op == Delete && len(e.Command.Value) != 0) || len(e.Command.Key)+len(e.Command.Value) > 1<<20 {
+		if e.Term < previousTerm || e.Term > req.Term || e.Command.Op > Delete || (e.Command.Op == Noop && (len(e.Command.Key) != 0 || len(e.Command.Value) != 0)) || (e.Command.Op == Delete && len(e.Command.Value) != 0) || len(e.Command.Key)+len(e.Command.Value) > 1<<20 {
 			return AppendResponse{}, errors.New("raft: invalid entry")
 		}
 		previousTerm = e.Term

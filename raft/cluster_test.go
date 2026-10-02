@@ -122,6 +122,12 @@ func TestClusterFailoverAndCatchUp(t *testing.T) {
 	if err := c.Put(ctx, []byte("gone"), []byte("stale")); err != nil {
 		t.Fatal(err)
 	}
+	if err := c.Put(ctx, nil, []byte("empty key")); err != nil {
+		t.Fatal(err)
+	}
+	if value, err := c.Get(ctx, nil); err != nil || string(value) != "empty key" {
+		t.Fatalf("empty key: %q %v", value, err)
+	}
 	c.Close()
 	nodes[old].close()
 	nodes[old] = nil
@@ -179,6 +185,9 @@ func TestClusterFailoverAndCatchUp(t *testing.T) {
 	}
 	if _, err := c.Get(ctx, []byte("gone")); !errors.Is(err, client.ErrNotFound) {
 		t.Fatalf("snapshot kept deleted key: %v", err)
+	}
+	if value, err := c.Get(ctx, nil); err != nil || string(value) != "empty key" {
+		t.Fatalf("snapshot lost empty key: %q %v", value, err)
 	}
 	c.Close()
 	nodes[old].close()
