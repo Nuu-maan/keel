@@ -69,12 +69,27 @@ func OpenCluster(dir string, id uint64, peers map[uint64]Peer, app *storage.Stor
 	if app == nil || len(peers) == 0 {
 		return nil, errors.New("raft: missing application store or peers")
 	}
+	existing, err := app.Snapshot()
+	if err != nil {
+		return nil, err
+	}
 	members := make([]uint64, 0, len(peers))
 	ownPeers := make(map[uint64]Peer, len(peers))
+	raftAddrs, clientAddrs := map[string]bool{}, map[string]bool{}
 	for id, p := range peers {
 		if p.RaftAddr == "" || p.ClientAddr == "" {
 			return nil, errors.New("raft: missing peer address")
 		}
+		if raftAddrs[p.RaftAddr] || clientAddrs[p.ClientAddr] {
+			return nil, errors.New("raft: duplicate peer address")
+		}
+		if _, _, err := net.SplitHostPort(p.RaftAddr); err != nil {
+			return nil, err
+		}
+		if _, _, err := net.SplitHostPort(p.ClientAddr); err != nil {
+			return nil, err
+		}
+		raftAddrs[p.RaftAddr], clientAddrs[p.ClientAddr] = true, true
 		members = append(members, id)
 		ownPeers[id] = p
 	}
@@ -107,7 +122,7 @@ func OpenCluster(dir string, id uint64, peers map[uint64]Peer, app *storage.Stor
 		}
 		return nil
 	}
-	node, err := Open(dir, Config{ID: id, Members: members, ElectionTicks: opts.ElectionTicks, Apply: apply, Restore: restore})
+	node, err := Open(dir, Config{ID: id, Members: members, ElectionTicks: opts.ElectionTicks, Apply: apply, Restore: restore, RequireExisting: len(existing) > 0})
 	if err != nil {
 		return nil, err
 	}

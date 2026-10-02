@@ -42,6 +42,7 @@ type Config struct {
 	ElectionTicks, HeartbeatTicks int
 	Apply                         func(Command) error
 	Restore                       func(map[string][]byte) error
+	RequireExisting               bool
 }
 
 type Status struct {
@@ -116,6 +117,8 @@ func Open(dir string, cfg Config) (*Node, error) {
 			_, logErr := s.Get([]byte("log"))
 			if logErr == nil {
 				err = errors.New("raft: log exists without state")
+			} else if errors.Is(logErr, storage.ErrNotFound) && cfg.RequireExisting {
+				err = errors.New("raft: state missing for existing application data")
 			} else if errors.Is(logErr, storage.ErrNotFound) {
 				err = nil
 			} else {

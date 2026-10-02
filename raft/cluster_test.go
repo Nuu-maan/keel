@@ -239,3 +239,33 @@ func TestMinorityCannotAcknowledgeOrRead(t *testing.T) {
 		t.Fatal("minority served read")
 	}
 }
+
+func TestClusterRejectsLostRaftState(t *testing.T) {
+	dir := t.TempDir()
+	app, err := storage.Open(filepath.Join(dir, "app"), storage.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer app.Close()
+	if err := app.Put([]byte("old"), []byte("value")); err != nil {
+		t.Fatal(err)
+	}
+	peers := map[uint64]Peer{1: {RaftAddr: "127.0.0.1:1", ClientAddr: "127.0.0.1:2"}}
+	if cluster, err := OpenCluster(filepath.Join(dir, "raft"), 1, peers, app, ClusterOptions{}); err == nil {
+		cluster.Close()
+		t.Fatal("opened stale app without Raft state")
+	}
+}
+
+func TestClusterRejectsDuplicatePeerAddresses(t *testing.T) {
+	app, err := storage.Open(t.TempDir(), storage.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer app.Close()
+	peers := map[uint64]Peer{1: {RaftAddr: "127.0.0.1:1", ClientAddr: "127.0.0.1:2"}, 2: {RaftAddr: "127.0.0.1:1", ClientAddr: "127.0.0.1:3"}}
+	if cluster, err := OpenCluster(t.TempDir(), 1, peers, app, ClusterOptions{}); err == nil {
+		cluster.Close()
+		t.Fatal("duplicate Raft address accepted")
+	}
+}
