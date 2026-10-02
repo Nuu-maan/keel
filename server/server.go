@@ -17,8 +17,14 @@ type Options struct {
 	WriteTimeout time.Duration
 }
 
+type Store interface {
+	Get([]byte) ([]byte, error)
+	Put([]byte, []byte) error
+	Delete([]byte) error
+}
+
 type Server struct {
-	store *storage.Store
+	store Store
 	opts  Options
 
 	mu       sync.Mutex
@@ -28,7 +34,7 @@ type Server struct {
 	handlers sync.WaitGroup
 }
 
-func New(store *storage.Store, opts Options) *Server {
+func New(store Store, opts Options) *Server {
 	if opts.MaxInFlight <= 0 {
 		opts.MaxInFlight = 256
 	}

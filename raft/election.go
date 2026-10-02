@@ -40,8 +40,9 @@ type Config struct {
 	ID                            uint64
 	Members                       []uint64
 	ElectionTicks, HeartbeatTicks int
-	// These must describe the caller's recovered durable log, not uncommitted memory.
-	LastLogIndex, LastLogTerm uint64
+	Apply                         func(Command) error
+	Restore                       func(map[string][]byte) error
+	RequireExisting               bool
 }
 
 type Status struct {
@@ -50,9 +51,9 @@ type Status struct {
 }
 
 type hardState struct {
-	ID             uint64
-	Members        []uint64
-	Term, VotedFor uint64
+	ID                     uint64
+	Members                []uint64
+	Term, VotedFor, Commit uint64
 }
 
 type Node struct {
@@ -60,6 +61,10 @@ type Node struct {
 	config           Config
 	state            hardState
 	store            *storage.Store
+	log              []Entry
+	snapshot         Snapshot
+	image            map[string][]byte
+	applied          uint64
 	role             Role
 	leader           uint64
 	votes            map[uint64]bool
@@ -89,30 +94,69 @@ func Open(dir string, cfg Config) (*Node, error) {
 	if cfg.HeartbeatTicks < 1 || cfg.ElectionTicks <= cfg.HeartbeatTicks || cfg.ElectionTicks > math.MaxInt/2 {
 		return nil, errors.New("raft: invalid tick intervals")
 	}
-	if (cfg.LastLogIndex == 0) != (cfg.LastLogTerm == 0) {
-		return nil, errors.New("raft: invalid log position")
-	}
 	s, err := storage.Open(dir, storage.Options{})
 	if err != nil {
 		return nil, err
 	}
 	n := &Node{config: cfg, store: s, state: hardState{ID: cfg.ID, Members: cfg.Members}}
-	data, err := s.Get([]byte("hard-state"))
+	data, err := s.Get([]byte("state"))
 	switch {
 	case errors.Is(err, storage.ErrNotFound):
-		if cfg.LastLogTerm != 0 {
-			err = errors.New("raft: missing state for nonempty log")
+		legacy, legacyErr := s.Get([]byte("hard-state"))
+		if legacyErr == nil {
+			err = json.Unmarshal(legacy, &n.state)
+			if err == nil {
+				logData, logErr := s.Get([]byte("log"))
+				if logErr == nil {
+					err = json.Unmarshal(logData, &n.log)
+				} else if !errors.Is(logErr, storage.ErrNotFound) {
+					err = logErr
+				}
+			}
+		} else if errors.Is(legacyErr, storage.ErrNotFound) {
+			_, logErr := s.Get([]byte("log"))
+			if logErr == nil {
+				err = errors.New("raft: log exists without state")
+			} else if errors.Is(logErr, storage.ErrNotFound) && cfg.RequireExisting {
+				err = errors.New("raft: state missing for existing application data")
+			} else if errors.Is(logErr, storage.ErrNotFound) {
+				err = nil
+			} else {
+				err = logErr
+			}
 		} else {
-			err = n.persist(n.state)
+			err = legacyErr
+		}
+		if err == nil {
+			err = n.persistDisk(n.state, n.log, Snapshot{})
 		}
 	case err == nil:
-		n.state = hardState{}
-		err = json.Unmarshal(data, &n.state)
+		var disk diskState
+		err = json.Unmarshal(data, &disk)
+		if err == nil {
+			n.state, n.log, n.snapshot = disk.State, disk.Log, disk.Snapshot
+		}
 	}
 	if err == nil && (n.state.ID != cfg.ID || !slices.Equal(n.state.Members, cfg.Members) ||
 		(n.state.VotedFor != 0 && !slices.Contains(cfg.Members, n.state.VotedFor)) ||
-		(n.state.Term == 0 && n.state.VotedFor != 0) || n.state.Term < cfg.LastLogTerm) {
+		(n.state.Term == 0 && n.state.VotedFor != 0)) {
 		err = errors.New("raft: invalid state or changed membership")
+	}
+	if err != nil {
+		s.Close()
+		return nil, err
+	}
+	if err := n.loadLog(); err != nil {
+		s.Close()
+		return nil, err
+	}
+	n.image = cloneImage(n.snapshot.Data)
+	n.applied = n.snapshot.Index
+	if n.snapshot.Index > 0 && n.config.Restore != nil {
+		err = n.config.Restore(n.image)
+	}
+	if err == nil {
+		err = n.applyCommitted()
 	}
 	if err != nil {
 		s.Close()
@@ -170,7 +214,7 @@ func (n *Node) Tick() ([]Message, error) {
 	n.votes = map[uint64]bool{n.config.ID: true}
 	n.resetTimeout()
 	if n.hasMajority() {
-		return n.becomeLeader(), nil
+		return n.becomeLeader()
 	}
 	return n.broadcast(RequestVote), nil
 }
@@ -196,7 +240,7 @@ func (n *Node) Step(m Message) ([]Message, error) {
 	}
 	switch m.Type {
 	case RequestVote:
-		fresh := m.LastLogTerm > n.config.LastLogTerm || (m.LastLogTerm == n.config.LastLogTerm && m.LastLogIndex >= n.config.LastLogIndex)
+		fresh := m.LastLogTerm > n.termAt(n.lastIndex()) || (m.LastLogTerm == n.termAt(n.lastIndex()) && m.LastLogIndex >= n.lastIndex())
 		grant := m.Term == n.state.Term && fresh && (n.state.VotedFor == 0 || n.state.VotedFor == m.From)
 		if grant {
 			state := n.state
@@ -211,7 +255,7 @@ func (n *Node) Step(m Message) ([]Message, error) {
 		if m.Term == n.state.Term && n.role == Candidate && m.Granted {
 			n.votes[m.From] = true
 			if n.hasMajority() {
-				return n.becomeLeader(), nil
+				return n.becomeLeader()
 			}
 		}
 	case Heartbeat:
@@ -231,17 +275,19 @@ func (n *Node) failure() error {
 	return n.err
 }
 
-func (n *Node) persist(state hardState) error {
-	data, err := json.Marshal(state)
+func (n *Node) persist(state hardState) error { return n.persistDisk(state, n.log, n.snapshot) }
+
+func (n *Node) persistDisk(state hardState, log []Entry, snapshot Snapshot) error {
+	data, err := json.Marshal(diskState{State: state, Log: log, Snapshot: snapshot})
 	if err == nil {
-		err = n.store.Put([]byte("hard-state"), data)
+		err = n.store.Put([]byte("state"), data)
 	}
 	if err != nil {
 		n.err = fmt.Errorf("raft: persist state: %w", err)
 		n.role, n.leader = Follower, 0
 		return n.err
 	}
-	n.state = state
+	n.state, n.log, n.snapshot = state, log, snapshot
 	return nil
 }
 
@@ -252,10 +298,13 @@ func (n *Node) resetTimeout() {
 
 func (n *Node) hasMajority() bool { return len(n.votes) > len(n.config.Members)/2 }
 
-func (n *Node) becomeLeader() []Message {
+func (n *Node) becomeLeader() ([]Message, error) {
+	if _, err := n.appendEntry(Command{}); err != nil {
+		return nil, err
+	}
 	n.role, n.leader, n.elapsed = Leader, n.config.ID, 0
 	n.votes = nil
-	return n.broadcast(Heartbeat)
+	return n.broadcast(Heartbeat), nil
 }
 
 func (n *Node) broadcast(kind MessageType) []Message {
@@ -263,7 +312,7 @@ func (n *Node) broadcast(kind MessageType) []Message {
 	for _, id := range n.config.Members {
 		if id != n.config.ID {
 			messages = append(messages, Message{Type: kind, From: n.config.ID, To: id, Term: n.state.Term,
-				LastLogIndex: n.config.LastLogIndex, LastLogTerm: n.config.LastLogTerm})
+				LastLogIndex: n.lastIndex(), LastLogTerm: n.termAt(n.lastIndex())})
 		}
 	}
 	return messages

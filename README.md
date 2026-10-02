@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/Nuu-maan/keel/actions/workflows/ci.yml/badge.svg)](https://github.com/Nuu-maan/keel/actions/workflows/ci.yml)
 
-Keel is a key-value store written from scratch in Go, working toward strongly consistent replication. The storage engine and TCP client/server are operational; the Raft election core is implemented, with replicated commands still in progress. No embedded database, no Raft library.
+Keel is a strongly consistent, replicated key-value store written from scratch in Go. It includes an LSM storage engine, a TCP client/server, and fixed-membership Raft replication. No embedded database or Raft library.
 
 The goal is correctness under failure first, then performance. Every durability or consistency claim below comes with a test that tries to break it.
 
@@ -20,8 +20,9 @@ The goal is correctness under failure first, then performance. Every durability 
 | Leveled compaction | Planned ([#13](https://github.com/Nuu-maan/keel/issues/13)) |
 | Background flush and compaction | Planned ([#7](https://github.com/Nuu-maan/keel/issues/7)) |
 | TCP wire protocol, server, client, CLI | Done |
-| Raft leader-election core | Done (protocol core; not connected to `keeld`) |
-| Raft transport and replication | Planned ([#21](https://github.com/Nuu-maan/keel/issues/21)) |
+| Raft elections, log replication, quorum writes and reads | Done |
+| Snapshot transfer and catch-up | Done |
+| Membership changes and segmented Raft log | Planned |
 | Chaos testing with linearizability checking | Planned |
 | Metrics and benchmarks | Planned |
 
@@ -37,17 +38,29 @@ go build -o keelctl ./cmd/keelctl
 ./keelctl del greeting
 ```
 
-`keeld` shuts down cleanly on `SIGINT` or `SIGTERM`: it stops accepting connections, lets running requests finish, and then closes the store.
+The default command starts one standalone node. For a three-node cluster on one machine:
+
+```sh
+PEERS='1=127.0.0.1:7081@127.0.0.1:7071,2=127.0.0.1:7082@127.0.0.1:7072,3=127.0.0.1:7083@127.0.0.1:7073'
+./keeld -id 1 -addr 127.0.0.1:7071 -peer-addr 127.0.0.1:7081 -peers "$PEERS" -dir data-1 &
+./keeld -id 2 -addr 127.0.0.1:7072 -peer-addr 127.0.0.1:7082 -peers "$PEERS" -dir data-2 &
+./keeld -id 3 -addr 127.0.0.1:7073 -peer-addr 127.0.0.1:7083 -peers "$PEERS" -dir data-3 &
+./keelctl -addr 127.0.0.1:7072 put greeting "hello cluster"
+./keelctl -addr 127.0.0.1:7073 get greeting
+```
+
+Wait a couple of seconds for election before the first request. Each node needs its own directory; keep its ID and peer list the same across restarts. Followers forward client calls to the known leader. Peer addresses outside loopback require mutual TLS via `-peer-cert`, `-peer-key`, and `-peer-ca` on every node. Client connections use the existing plain TCP protocol, so expose that port only on a trusted network or behind a TLS proxy ([#27](https://github.com/Nuu-maan/keel/issues/27)). `keeld` shuts down cleanly on `SIGINT` or `SIGTERM`.
+
 
 ## Architecture
 
-The target design. The storage engine and the client network layer are built. The election core is implemented; Raft peer transport and log replication come next.
+The three-node cluster follows this design. Cluster membership is currently fixed at startup ([#25](https://github.com/Nuu-maan/keel/issues/25)).
 
 ![Keel architecture: clients talk to a Raft leader, which replicates to two followers; each node runs the LSM storage engine](docs/diagrams/architecture.png)
 
 ## Guarantees
 
-**Durability.** A write is acknowledged only after its WAL record has been written and `fsync`ed. An acknowledged write survives a process crash at any point.
+**Durability.** In standalone mode, a write is acknowledged after its WAL record is `fsync`ed. In cluster mode, the leader acknowledges only after a majority has durably stored the Raft entry and the leader has applied it. An acknowledged write survives the loss of a minority of nodes.
 
 **Group commit.** One writer goroutine owns the WAL. Each `Put` or `Delete` sends its record to that goroutine and waits. The writer takes every request already queued, appends the whole batch with one `write` and one `fsync`, applies it to the memtable, and then acknowledges each caller. Durability is unchanged, because nobody is acknowledged before the `fsync` that covers their record. The store lock is held only while applying a batch or swapping in new tables, never across an `fsync`, so reads don't wait on the disk.
 
@@ -115,15 +128,13 @@ status   : 0 ok · 1 not found · 2 error (value holds the message)
 - **Hostile input.** A length prefix over 16 MiB is rejected before anything is allocated. A malformed request or unknown op closes the connection, because with a broken frame there's no trustworthy request ID to answer.
 - **Deadlines.** A connection with no request for 5 minutes is closed. A response that can't be written within 10 seconds closes the connection. The client passes its `context` deadline down to the socket as a write deadline.
 
-## Raft election core
+## Raft replication
 
-`raft.Node` implements fixed-membership elections following [the Raft paper](https://raft.github.io/raft.pdf): randomized election timeouts, one vote per term, majority election, periodic heartbeats, and step-down on a higher term. Duplicate votes cannot form a majority, and vote requests must have a log at least as up to date as the local recovered log.
+`raft.Node` implements fixed-membership elections, log matching, durable quorum commits, and snapshot installation following [the Raft paper](https://raft.github.io/raft.pdf). Terms, votes, committed index, log entries, and snapshots are stored in one durable record before dependent messages are returned. Each node keeps a separate application store and replays committed commands after restart. A persistence or application error stops protocol participation.
 
-Term and vote are stored together in a dedicated Keel storage directory before any dependent message is returned. A persistence error stops protocol participation. Restart restores the durable term and vote but always starts as a follower; changing node identity or membership on reopen is rejected. Each directory must have exactly one owner.
+Leaders append a no-op entry in their own term after election. Writes return only after the entry reaches a majority and is applied. For a read, the leader first confirms its term with a majority, then reads its applied state; this also rejects reads by an isolated old leader. A node that falls behind receives missing entries or a snapshot, then replays the remaining suffix. Snapshot installation replaces the follower's application state, including deleted keys. Elections use randomized 1–1.9 second timeouts and 100 ms heartbeat ticks by default. Tune `-raft-tick`, `-election-ticks`, and `-peer-timeout` for your network and disk latency.
 
-The caller drives `Tick` at a fixed interval and delivers messages returned by `Tick` and `Step`. Election timeouts range from 10 to 19 ticks by default; leaders emit heartbeats every tick. `Config` allows both intervals to be tuned and accepts the recovered log position for voting. The current core does not append logs or apply commands. Its heartbeat responses do not establish authority for reads or acknowledge replicated entries.
-
-Tests simulate a three-node election, stable heartbeats, an isolated leader, majority failover, and healing. They also cover duplicate and stale votes, split-vote retries, restart voting safety, log freshness, invalid membership/messages, and persistence failure. `keeld` continues to serve a standalone store; peer transport, command replication, snapshots, and linearizable reads are tracked in [#21](https://github.com/Nuu-maan/keel/issues/21).
+The current Raft log is stored as one atomic value and compacted after 128 committed entries when the snapshot fits in 8 MiB. Larger snapshots are deferred so lagging nodes can still catch up through log entries. This keeps conflict rewrites crash-safe but makes each append proportional to the un-compacted log size. Commands are limited to 1 MiB, and peer RPC bodies to 16 MiB. Fixed membership ([#25](https://github.com/Nuu-maan/keel/issues/25)), chunked snapshots and a segmented Raft log ([#24](https://github.com/Nuu-maan/keel/issues/24)) are future work. Cluster writes made without a majority may later commit; an error means the outcome is unknown. A retry is a new operation and can reorder with another write to the same key. Stable client request IDs for deduplication are tracked in [#28](https://github.com/Nuu-maan/keel/issues/28).
 
 ## On-disk format
 
@@ -188,6 +199,7 @@ Tests aim at failure modes, not just happy paths.
 - **Filter effectiveness.** A test fills an SSTable's data blocks with garbage but leaves the filter and index intact. Lookups for absent keys still succeed, because the filter stops them before any block is read. With the filter disabled, 1999 of 2000 of those lookups read a block.
 - **Batching.** A test holds the store lock while 64 writers queue up, then checks that they all reach disk in at most 4 WAL commits. Disabling the batching loop makes it fail with 64 commits.
 - **Network, end to end.** The tests run a real server on a loopback socket. They cover put, get and delete, and 500 concurrent calls pipelined over a single connection. They also check that the server closes the connection on an unknown op, an oversized length prefix or an idle timeout, and that clients fail cleanly when the server shuts down.
+- **Raft over real sockets.** Three nodes elect a leader, forward client calls, survive leader loss, reject minority writes and reads, install a snapshot, catch up the log suffix, and recover after restart. Peer TLS is tested with and without a client certificate; a separate test kills and restarts a daemon process after acknowledged writes.
 - **Race detector.** CI runs the whole suite with `-race`.
 
 `SIGKILL` leaves the kernel page cache intact, so it doesn't simulate power loss. Power-loss testing is tracked in [#2](https://github.com/Nuu-maan/keel/issues/2).
@@ -205,7 +217,7 @@ cmd/
 wire/          frame and message encoding
 server/        TCP server: pipelining, backpressure, deadlines, shutdown
 client/        Go client: pipelined calls over one connection, context support
-raft/          durable leader-election core and simulated-cluster tests
+raft/          elections, durable log, snapshots, peer transport, quorum reads/writes
 storage/
   wal.go       write-ahead log: record format, append, replay, torn-tail recovery
   sstable.go   SSTable writer and reader: blocks, filter, index, footer
@@ -217,7 +229,7 @@ storage/
 ## Roadmap
 
 1. **Storage engine.** Leveled compaction ([#13](https://github.com/Nuu-maan/keel/issues/13)), background flush ([#7](https://github.com/Nuu-maan/keel/issues/7)).
-2. **Raft.** Election core complete. Peer transport, log replication, snapshots, and linearizable reads through ReadIndex ([#21](https://github.com/Nuu-maan/keel/issues/21)).
-3. **Chaos testing.** Process kills, `SIGSTOP`, network partitions with `iptables`, latency with `tc netem`. Recorded histories checked for linearizability with [Porcupine](https://github.com/anishathalye/porcupine).
+2. **Raft.** Fixed-membership replication is operational. Segmented logs and chunked snapshots ([#24](https://github.com/Nuu-maan/keel/issues/24)), then membership changes ([#25](https://github.com/Nuu-maan/keel/issues/25)).
+3. **Chaos testing** ([#26](https://github.com/Nuu-maan/keel/issues/26)). Process kills, `SIGSTOP`, network partitions with `iptables`, latency with `tc netem`. Recorded histories checked for linearizability with [Porcupine](https://github.com/anishathalye/porcupine).
 4. **Observability.** Prometheus metrics for latency histograms, `fsync` time, replication lag and elections.
 5. **Benchmarks.** Throughput and p50/p99/p99.9 latency under uniform and Zipfian workloads, compared with etcd.

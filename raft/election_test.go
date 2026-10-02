@@ -175,11 +175,17 @@ func TestLogFreshness(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	entries := make([]Entry, 10)
+	for i := range entries {
+		entries[i].Term = 3
+	}
+	if _, err := n.Append(AppendRequest{From: 2, To: 1, Term: 3, Entries: entries}); err != nil {
+		t.Fatal(err)
+	}
 	step(t, n, Message{Type: Heartbeat, From: 2, To: 1, Term: 5})
 	if err := n.Close(); err != nil {
 		t.Fatal(err)
 	}
-	cfg.LastLogIndex, cfg.LastLogTerm = 10, 3
 	n, err = Open(dir, cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -262,8 +268,6 @@ func TestInvalidConfigAndCorruptState(t *testing.T) {
 		{}, {ID: 1, Members: []uint64{1, 1}}, {ID: 1, Members: []uint64{0, 1}},
 		{ID: 1, Members: []uint64{2}}, {ID: 1, Members: []uint64{1}, ElectionTicks: -1},
 		{ID: 1, Members: []uint64{1}, ElectionTicks: 2, HeartbeatTicks: 2},
-		{ID: 1, Members: []uint64{1}, LastLogIndex: 1},
-		{ID: 1, Members: []uint64{1}, LastLogIndex: 1, LastLogTerm: 1},
 	} {
 		if n, err := Open(t.TempDir(), cfg); err == nil {
 			n.Close()
@@ -276,7 +280,7 @@ func TestInvalidConfigAndCorruptState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := n.store.Put([]byte("hard-state"), []byte(`{"ID":1,"Members":[1,2,3],"Term":2,"VotedFor":99}`)); err != nil {
+	if err := n.store.Put([]byte("state"), []byte(`{"State":{"ID":1,"Members":[1,2,3],"Term":2,"VotedFor":99}}`)); err != nil {
 		t.Fatal(err)
 	}
 	if err := n.Close(); err != nil {
