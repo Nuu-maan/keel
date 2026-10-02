@@ -39,7 +39,7 @@ func TestReplicationCommitAndRestart(t *testing.T) {
 	if _, commit, last := leader.LogInfo(); commit != 0 || last != 1 {
 		t.Fatal("leader no-op should start uncommitted")
 	}
-	req := AppendRequest{From: 1, Term: 1, Entries: []Entry{{Term: 1}}}
+	req := AppendRequest{From: 1, To: 2, Term: 1, Entries: []Entry{{Term: 1}}}
 	if r, err := nodes[1].Append(req); err != nil || !r.Success || r.MatchIndex != 1 {
 		t.Fatalf("no-op append: %+v %v", r, err)
 	}
@@ -56,7 +56,7 @@ func TestReplicationCommitAndRestart(t *testing.T) {
 	if applied[0]["k"] != "" {
 		t.Fatal("applied before quorum")
 	}
-	req = AppendRequest{From: 1, Term: 1, PrevIndex: 1, PrevTerm: 1, LeaderCommit: 1, Entries: []Entry{{Term: 1, Command: Command{Op: Put, Key: []byte("k"), Value: []byte("v")}}}}
+	req = AppendRequest{From: 1, To: 2, Term: 1, PrevIndex: 1, PrevTerm: 1, LeaderCommit: 1, Entries: []Entry{{Term: 1, Command: Command{Op: Put, Key: []byte("k"), Value: []byte("v")}}}}
 	if r, err := nodes[1].Append(req); err != nil || !r.Success {
 		t.Fatalf("append: %+v %v", r, err)
 	}
@@ -97,24 +97,24 @@ func TestConflictAndCommittedPrefix(t *testing.T) {
 		}
 		return r
 	}
-	if r := appendReq(AppendRequest{From: 1, Term: 1, PrevIndex: 1}); r.Success {
+	if r := appendReq(AppendRequest{From: 1, To: 2, Term: 1, PrevIndex: 1}); r.Success {
 		t.Fatal("accepted missing predecessor")
 	}
-	appendReq(AppendRequest{From: 1, Term: 1, Entries: []Entry{{Term: 1}, {Term: 1, Command: Command{Op: Put, Key: []byte("k"), Value: []byte("old")}}}, LeaderCommit: 1})
-	if r := appendReq(AppendRequest{From: 3, Term: 2, PrevIndex: 1, PrevTerm: 2}); r.Success {
+	appendReq(AppendRequest{From: 1, To: 2, Term: 1, Entries: []Entry{{Term: 1}, {Term: 1, Command: Command{Op: Put, Key: []byte("k"), Value: []byte("old")}}}, LeaderCommit: 1})
+	if r := appendReq(AppendRequest{From: 3, To: 2, Term: 2, PrevIndex: 1, PrevTerm: 2}); r.Success {
 		t.Fatal("accepted mismatched predecessor")
 	}
-	if _, err := n.Append(AppendRequest{From: 3, Term: 2, PrevIndex: 0, Entries: []Entry{{Term: 2}}}); err == nil {
+	if _, err := n.Append(AppendRequest{From: 3, To: 2, Term: 2, PrevIndex: 0, Entries: []Entry{{Term: 2}}}); err == nil {
 		t.Fatal("overwrote committed prefix")
 	}
-	req := AppendRequest{From: 3, Term: 2, PrevIndex: 1, PrevTerm: 1, Entries: []Entry{{Term: 2, Command: Command{Op: Put, Key: []byte("k"), Value: []byte("new")}}}}
+	req := AppendRequest{From: 3, To: 2, Term: 2, PrevIndex: 1, PrevTerm: 1, Entries: []Entry{{Term: 2, Command: Command{Op: Put, Key: []byte("k"), Value: []byte("new")}}}}
 	if r := appendReq(req); !r.Success || r.MatchIndex != 2 {
 		t.Fatalf("conflict replacement: %+v", r)
 	}
 	if _, _, last := n.LogInfo(); last != 2 {
 		t.Fatal("bad truncation")
 	}
-	if _, err := n.Append(AppendRequest{From: 1, Term: 1}); err != nil {
+	if _, err := n.Append(AppendRequest{From: 1, To: 2, Term: 1}); err != nil {
 		t.Fatal(err)
 	}
 	if s := n.Status(); s.Term != 2 || s.Leader != 3 {
