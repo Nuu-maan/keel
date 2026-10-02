@@ -164,6 +164,33 @@ func (s *Store) Get(key []byte) ([]byte, error) {
 	return bytes.Clone(rec.Value), nil
 }
 
+func (s *Store) Snapshot() (map[string][]byte, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	result := map[string][]byte{}
+	for _, t := range slices.Backward(s.tables) {
+		recs, err := t.all()
+		if err != nil {
+			return nil, err
+		}
+		for _, rec := range recs {
+			if rec.Op == OpDelete {
+				delete(result, string(rec.Key))
+			} else {
+				result[string(rec.Key)] = bytes.Clone(rec.Value)
+			}
+		}
+	}
+	for key, rec := range s.mem {
+		if rec.Op == OpDelete {
+			delete(result, key)
+		} else {
+			result[key] = bytes.Clone(rec.Value)
+		}
+	}
+	return result, nil
+}
+
 func (s *Store) Put(key, value []byte) error {
 	return s.write(Record{Op: OpPut, Key: bytes.Clone(key), Value: bytes.Clone(value)})
 }
