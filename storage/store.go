@@ -196,8 +196,6 @@ func (s *Store) Get(key []byte) ([]byte, error) {
 	return bytes.Clone(rec.Value), nil
 }
 
-// candidates lists, newest first, every table that may hold key: all of L0, then the
-// one table per deeper level whose range can contain it.
 func (s *Store) candidates(key []byte) []*sstable {
 	tables := slices.Clone(s.levels[0])
 	for _, level := range s.levels[1:] {
@@ -404,10 +402,8 @@ func levelBytes(tables []*sstable) int64 {
 	return n
 }
 
-// compactLevel merges tables from level into level+1. From L0 it takes every table,
-// since they may overlap; from a deeper level it takes one, round-robin through the
-// key space. Overlapping tables in level+1 join the merge so that level stays a
-// non-overlapping run.
+// L0 must be compacted as a whole: its tables overlap, so moving only the newer ones
+// down would leave an older version above them that shadows the newer data.
 func (s *Store) compactLevel(level int) error {
 	upper := s.levels[0]
 	if level > 0 {
