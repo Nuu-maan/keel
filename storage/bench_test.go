@@ -3,6 +3,7 @@ package storage
 import (
 	"cmp"
 	"fmt"
+	"math/rand/v2"
 	"os"
 	"runtime"
 	"sync/atomic"
@@ -51,5 +52,24 @@ func BenchmarkPut(b *testing.B) {
 				}
 			})
 		})
+	}
+}
+
+func BenchmarkWriteAmplification(b *testing.B) {
+	const userBytes = 32 << 20
+	value := make([]byte, 100)
+	for b.Loop() {
+		s, err := Open(b.TempDir(), Options{MemtableSize: 256 << 10})
+		if err != nil {
+			b.Fatal(err)
+		}
+		rng := rand.New(rand.NewPCG(1, 1))
+		for written := 0; written < userBytes; written += 16 + len(value) {
+			if err := s.Put(fmt.Appendf(nil, "key-%011d", rng.IntN(200_000)), value); err != nil {
+				b.Fatal(err)
+			}
+		}
+		s.Close()
+		b.ReportMetric(float64(s.tableBytes)/float64(s.userBytes), "write-amp")
 	}
 }

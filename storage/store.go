@@ -26,7 +26,8 @@ type Options struct {
 	CompactionTrigger int
 }
 
-// Only the writer goroutine touches wal, walNum, memSize, nextNum, err and batches.
+// Only the writer goroutine touches wal, walNum, memSize, nextNum, err, batches and the
+// byte counters.
 // mu guards mem and tables, which readers also use; the writer holds it only to apply
 // a batch or swap in flushed tables, never across a WAL fsync.
 type Store struct {
@@ -48,6 +49,9 @@ type Store struct {
 	nextNum uint64
 	err     error
 	batches int
+
+	userBytes  int64
+	tableBytes int64
 }
 
 type writeReq struct {
@@ -267,6 +271,9 @@ func (s *Store) commitBatch(batch []writeReq) error {
 		return err
 	}
 	s.batches++
+	for _, rec := range recs {
+		s.userBytes += int64(len(rec.Key) + len(rec.Value))
+	}
 	s.mu.Lock()
 	for _, rec := range recs {
 		s.apply(rec)
@@ -371,7 +378,12 @@ func (s *Store) writeTable(recs []Record) (*sstable, error) {
 	if err := writeSSTable(s.path(num, "sst"), recs); err != nil {
 		return nil, err
 	}
-	return s.openTable(num)
+	table, err := s.openTable(num)
+	if err != nil {
+		return nil, err
+	}
+	s.tableBytes += table.size
+	return table, nil
 }
 
 func (s *Store) openTable(num uint64) (*sstable, error) {
