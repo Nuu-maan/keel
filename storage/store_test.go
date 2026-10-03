@@ -55,7 +55,7 @@ func TestStoreCopiesValues(t *testing.T) {
 
 const crashDirEnv = "KEEL_CRASH_DIR"
 
-var crashOpts = Options{MemtableSize: 4 << 10, CompactionTrigger: 3}
+var crashOpts = Options{MemtableSize: 4 << 10, CompactionTrigger: 3, LevelSize: 16 << 10, TableSize: 4 << 10}
 
 func TestCrashRecovery(t *testing.T) {
 	if dir := os.Getenv(crashDirEnv); dir != "" {
@@ -130,7 +130,7 @@ func runCrashWriter(dir string) {
 
 func TestStoreMatchesModelAcrossFlushesAndReopens(t *testing.T) {
 	dir := t.TempDir()
-	opts := Options{MemtableSize: 2 << 10}
+	opts := Options{MemtableSize: 2 << 10, LevelSize: 8 << 10, TableSize: 2 << 10}
 	s, err := Open(dir, opts)
 	if err != nil {
 		t.Fatal(err)
@@ -147,7 +147,7 @@ func TestStoreMatchesModelAcrossFlushesAndReopens(t *testing.T) {
 			}
 			delete(model, key)
 		} else {
-			val := fmt.Sprintf("v%d", i)
+			val := fmt.Sprintf("v%-40d", i)
 			if err := s.Put([]byte(key), []byte(val)); err != nil {
 				t.Fatal(err)
 			}
@@ -161,11 +161,9 @@ func TestStoreMatchesModelAcrossFlushesAndReopens(t *testing.T) {
 		}
 	}
 
-	if len(s.tables) >= defaultCompactionTrigger {
-		t.Fatalf("%d SSTables, compaction should keep it below %d", len(s.tables), defaultCompactionTrigger)
-	}
-	if ssts, _ := filepath.Glob(filepath.Join(dir, "*.sst")); len(ssts) != len(s.tables) {
-		t.Fatalf("%d SSTable files on disk for %d live tables", len(ssts), len(s.tables))
+	checkLevels(t, s)
+	if len(s.levels[2]) == 0 {
+		t.Fatal("workload never reached L2, so deeper compactions were not exercised")
 	}
 	for i := range 500 {
 		key := fmt.Sprintf("k%04d", i)
@@ -210,7 +208,7 @@ func TestOpenDeletesFilesNotInManifest(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "000005.sst.tmp"), []byte("partial"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeManifest(dir, manifest{logNum: 3, tables: []uint64{2}}); err != nil {
+	if err := writeManifest(dir, manifest{logNum: 3, levels: [][]uint64{{2}}}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -267,18 +265,15 @@ func TestCompactionDropsOverwritesAndTombstones(t *testing.T) {
 	if err := s.flush(); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.compact(); err != nil {
+	if err := s.compactLevel(0); err != nil {
 		t.Fatal(err)
 	}
 	s.mu.Unlock()
 
-	if len(s.tables) != 1 {
-		t.Fatalf("%d tables after compaction, want 1", len(s.tables))
+	if len(s.levels[0]) != 0 {
+		t.Fatalf("%d tables left in L0 after compaction", len(s.levels[0]))
 	}
-	recs, err := s.tables[0].all()
-	if err != nil {
-		t.Fatal(err)
-	}
+	recs := levelRecords(t, s.levels[1])
 	if len(recs) != 50 {
 		t.Fatalf("compacted table holds %d records, want the 50 live keys", len(recs))
 	}
@@ -298,9 +293,7 @@ func TestCompactionDropsOverwritesAndTombstones(t *testing.T) {
 			t.Fatalf("k%03d = %q, %v after reopen", i, v, err)
 		}
 	}
-	if ssts, _ := filepath.Glob(filepath.Join(dir, "*.sst")); len(ssts) != 1 {
-		t.Fatalf("compaction inputs left on disk: %v", ssts)
-	}
+	checkLevels(t, s)
 }
 
 func TestConcurrentWritesShareBatches(t *testing.T) {
