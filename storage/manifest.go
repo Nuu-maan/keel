@@ -7,24 +7,35 @@ import (
 	"hash/crc32"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 )
 
 const manifestName = "MANIFEST"
 
+const maxLevels = 7
+
+// levels[0] lists L0 tables oldest first; deeper levels list tables in key order.
 type manifest struct {
 	logNum uint64
-	tables []uint64
+	levels [][]uint64
+}
+
+func (m manifest) tables() []uint64 {
+	return slices.Concat(m.levels...)
 }
 
 func (m manifest) encode() []byte {
 	var b bytes.Buffer
-	fmt.Fprintf(&b, "log %d\ntables", m.logNum)
-	for _, num := range m.tables {
-		fmt.Fprintf(&b, " %d", num)
+	fmt.Fprintf(&b, "log %d\n", m.logNum)
+	for level, nums := range m.levels {
+		fmt.Fprintf(&b, "level %d", level)
+		for _, num := range nums {
+			fmt.Fprintf(&b, " %d", num)
+		}
+		b.WriteString("\n")
 	}
-	b.WriteString("\n")
 	fmt.Fprintf(&b, "crc %d\n", crc32.Checksum(b.Bytes(), crcTable))
 	return b.Bytes()
 }
@@ -50,12 +61,13 @@ func readManifest(dir string) (m manifest, found bool, err error) {
 
 func parseManifest(data []byte) (manifest, error) {
 	lines := strings.Split(strings.TrimSuffix(string(data), "\n"), "\n")
-	if len(lines) != 3 {
+	if len(lines) < 2 {
 		return manifest{}, ErrCorrupt
 	}
-	body := strings.Join(lines[:2], "\n") + "\n"
+	last := len(lines) - 1
+	body := strings.Join(lines[:last], "\n") + "\n"
 	var sum uint32
-	if _, err := fmt.Sscanf(lines[2], "crc %d", &sum); err != nil || sum != crc32.Checksum([]byte(body), crcTable) {
+	if _, err := fmt.Sscanf(lines[last], "crc %d", &sum); err != nil || sum != crc32.Checksum([]byte(body), crcTable) {
 		return manifest{}, ErrCorrupt
 	}
 
@@ -63,16 +75,31 @@ func parseManifest(data []byte) (manifest, error) {
 	if _, err := fmt.Sscanf(lines[0], "log %d", &m.logNum); err != nil {
 		return manifest{}, ErrCorrupt
 	}
-	fields := strings.Fields(lines[1])
-	if len(fields) == 0 || fields[0] != "tables" {
-		return manifest{}, ErrCorrupt
-	}
-	for _, f := range fields[1:] {
-		num, err := strconv.ParseUint(f, 10, 64)
-		if err != nil {
+	for _, line := range lines[1:last] {
+		fields := strings.Fields(line)
+		level := 0
+		switch {
+		case len(fields) >= 1 && fields[0] == "tables":
+			fields = fields[1:]
+		case len(fields) >= 2 && fields[0] == "level":
+			n, err := strconv.Atoi(fields[1])
+			if err != nil || n < 0 || n >= maxLevels {
+				return manifest{}, ErrCorrupt
+			}
+			level, fields = n, fields[2:]
+		default:
 			return manifest{}, ErrCorrupt
 		}
-		m.tables = append(m.tables, num)
+		for len(m.levels) <= level {
+			m.levels = append(m.levels, nil)
+		}
+		for _, f := range fields {
+			num, err := strconv.ParseUint(f, 10, 64)
+			if err != nil {
+				return manifest{}, ErrCorrupt
+			}
+			m.levels[level] = append(m.levels[level], num)
+		}
 	}
 	return m, nil
 }

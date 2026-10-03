@@ -103,16 +103,16 @@ func (s *Store) recover(ssts, wals []uint64) error {
 	if !found && len(ssts) > 0 {
 		return fmt.Errorf("storage: SSTables exist but %s is missing", manifestName)
 	}
-	s.nextNum = slices.Max(slices.Concat(ssts, wals, m.tables, []uint64{m.logNum})) + 1
+	s.nextNum = slices.Max(slices.Concat(ssts, wals, m.tables(), []uint64{m.logNum})) + 1
 
 	for _, num := range ssts {
-		if !slices.Contains(m.tables, num) {
+		if !slices.Contains(m.tables(), num) {
 			if err := os.Remove(s.path(num, "sst")); err != nil {
 				return err
 			}
 		}
 	}
-	for _, num := range m.tables {
+	for _, num := range m.tables() {
 		table, err := s.openTable(num)
 		if err != nil {
 			return err
@@ -361,9 +361,9 @@ func (s *Store) compact() error {
 }
 
 func (s *Store) commit(tables []*sstable) error {
-	m := manifest{logNum: s.walNum}
+	m := manifest{logNum: s.walNum, levels: [][]uint64{nil}}
 	for _, t := range slices.Backward(tables) {
-		m.tables = append(m.tables, t.num)
+		m.levels[0] = append(m.levels[0], t.num)
 	}
 	if err := writeManifest(s.dir, m); err != nil {
 		return err

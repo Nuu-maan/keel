@@ -210,7 +210,7 @@ func TestOpenDeletesFilesNotInManifest(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "000005.sst.tmp"), []byte("partial"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeManifest(dir, manifest{logNum: 3, tables: []uint64{2}}); err != nil {
+	if err := writeManifest(dir, manifest{logNum: 3, levels: [][]uint64{{2}}}); err != nil {
 		t.Fatal(err)
 	}
 
