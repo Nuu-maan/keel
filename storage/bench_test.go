@@ -56,20 +56,24 @@ func BenchmarkPut(b *testing.B) {
 }
 
 func BenchmarkWriteAmplification(b *testing.B) {
-	const userBytes = 32 << 20
 	value := make([]byte, 100)
-	for b.Loop() {
-		s, err := Open(b.TempDir(), Options{MemtableSize: 256 << 10})
-		if err != nil {
-			b.Fatal(err)
-		}
-		rng := rand.New(rand.NewPCG(1, 1))
-		for written := 0; written < userBytes; written += 16 + len(value) {
-			if err := s.Put(fmt.Appendf(nil, "key-%011d", rng.IntN(200_000)), value); err != nil {
-				b.Fatal(err)
+	for _, mib := range []int{16, 64, 128} {
+		b.Run(fmt.Sprintf("data=%dMiB", mib), func(b *testing.B) {
+			puts := mib << 20 / (16 + len(value))
+			for b.Loop() {
+				s, err := Open(b.TempDir(), Options{MemtableSize: 256 << 10, LevelSize: 1 << 20, TableSize: 256 << 10})
+				if err != nil {
+					b.Fatal(err)
+				}
+				rng := rand.New(rand.NewPCG(1, 1))
+				for range puts {
+					if err := s.Put(fmt.Appendf(nil, "key-%011d", rng.IntN(2*puts)), value); err != nil {
+						b.Fatal(err)
+					}
+				}
+				s.Close()
+				b.ReportMetric(float64(s.tableBytes)/float64(s.userBytes), "write-amp")
 			}
-		}
-		s.Close()
-		b.ReportMetric(float64(s.tableBytes)/float64(s.userBytes), "write-amp")
+		})
 	}
 }
