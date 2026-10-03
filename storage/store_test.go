@@ -55,7 +55,7 @@ func TestStoreCopiesValues(t *testing.T) {
 
 const crashDirEnv = "KEEL_CRASH_DIR"
 
-var crashOpts = Options{MemtableSize: 4 << 10, CompactionTrigger: 3}
+var crashOpts = Options{MemtableSize: 4 << 10, CompactionTrigger: 3, LevelSize: 16 << 10, TableSize: 4 << 10}
 
 func TestCrashRecovery(t *testing.T) {
 	if dir := os.Getenv(crashDirEnv); dir != "" {
