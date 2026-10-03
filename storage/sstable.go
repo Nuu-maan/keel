@@ -63,11 +63,12 @@ type blockHandle struct {
 }
 
 type sstable struct {
-	num    uint64
-	size   int64
-	f      *os.File
-	filter []byte
-	index  []blockHandle
+	num      uint64
+	size     int64
+	smallest []byte
+	f        *os.File
+	filter   []byte
+	index    []blockHandle
 }
 
 func openSSTable(path string) (*sstable, error) {
@@ -146,6 +147,51 @@ func readMeta(f *os.File) (*sstable, error) {
 		index = append(index, h)
 	}
 	return &sstable{f: f, size: int64(size), filter: filter, index: index}, nil
+}
+
+func (t *sstable) smallestKey() ([]byte, error) {
+	if t.smallest != nil || len(t.index) == 0 {
+		return t.smallest, nil
+	}
+	err := t.scanBlock(t.index[0], func(rec Record) bool {
+		t.smallest = bytes.Clone(rec.Key)
+		return false
+	})
+	return t.smallest, err
+}
+
+func (t *sstable) largest() []byte {
+	if len(t.index) == 0 {
+		return nil
+	}
+	return t.index[len(t.index)-1].lastKey
+}
+
+type tableIter struct {
+	t     *sstable
+	block int
+	recs  []Record
+	err   error
+}
+
+func (t *sstable) iter() *tableIter {
+	return &tableIter{t: t}
+}
+
+func (it *tableIter) next() (Record, bool) {
+	for len(it.recs) == 0 {
+		if it.err != nil || it.block == len(it.t.index) {
+			return Record{}, false
+		}
+		it.err = it.t.scanBlock(it.t.index[it.block], func(rec Record) bool {
+			it.recs = append(it.recs, rec)
+			return true
+		})
+		it.block++
+	}
+	rec := it.recs[0]
+	it.recs = it.recs[1:]
+	return rec, true
 }
 
 func (t *sstable) get(key []byte) (Record, bool, error) {
