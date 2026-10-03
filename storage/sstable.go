@@ -64,6 +64,7 @@ type blockHandle struct {
 
 type sstable struct {
 	num    uint64
+	size   int64
 	f      *os.File
 	filter []byte
 	index  []blockHandle
@@ -144,7 +145,7 @@ func readMeta(f *os.File) (*sstable, error) {
 		}
 		index = append(index, h)
 	}
-	return &sstable{f: f, filter: filter, index: index}, nil
+	return &sstable{f: f, size: int64(size), filter: filter, index: index}, nil
 }
 
 func (t *sstable) get(key []byte) (Record, bool, error) {
