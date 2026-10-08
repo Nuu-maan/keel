@@ -55,8 +55,6 @@ func TestCompactionKeepsTombstoneWhileDeeperLevelHoldsKey(t *testing.T) {
 	defer func() { s.Close() }()
 	step := func(f func() error) {
 		t.Helper()
-		s.mu.Lock()
-		defer s.mu.Unlock()
 		if err := f(); err != nil {
 			t.Fatal(err)
 		}

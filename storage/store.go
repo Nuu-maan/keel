@@ -37,9 +37,9 @@ type Options struct {
 }
 
 // Only the writer goroutine touches wal, walNum, logNum, memSize, err, batches,
-// compactFrom and the byte counters. mu guards mem and levels, which readers also use;
-// the writer holds it only to apply a batch or swap in new tables, never across a WAL
-// fsync.
+// compactFrom and the byte counters. mu guards mem and levels, which readers also use.
+// The writer is the only goroutine that changes them, so it reads them without the
+// lock and holds it only to apply a batch or swap in new tables, never across I/O.
 //
 // levels[0] holds flushed tables newest first, and their key ranges may overlap.
 // Every deeper level is a sorted run of non-overlapping tables. For any key, a version
@@ -307,10 +307,7 @@ func (s *Store) commitBatch(batch []writeReq) error {
 		return s.err
 	}
 	if s.memSize >= s.opts.MemtableSize {
-		s.mu.Lock()
-		err := s.flushAndCompact()
-		s.mu.Unlock()
-		if err != nil {
+		if err := s.flushAndCompact(); err != nil {
 			s.err = fmt.Errorf("storage: flush or compaction failed, store is read-only: %w", err)
 			return s.err
 		}
@@ -377,7 +374,10 @@ func (s *Store) flush() error {
 	if err := s.commit(levels); err != nil {
 		return err
 	}
-	s.mem, s.memSize = map[string]Record{}, 0
+	s.mu.Lock()
+	s.mem = map[string]Record{}
+	s.mu.Unlock()
+	s.memSize = 0
 	oldWAL.Close()
 	os.Remove(s.path(oldNum, "wal"))
 	return nil
@@ -571,7 +571,9 @@ func (s *Store) commit(levels [][]*sstable) error {
 	if err := writeManifest(s.dir, m); err != nil {
 		return err
 	}
+	s.mu.Lock()
 	s.levels = levels
+	s.mu.Unlock()
 	return nil
 }
 

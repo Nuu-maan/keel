@@ -261,14 +261,12 @@ func TestCompactionDropsOverwritesAndTombstones(t *testing.T) {
 			}
 		}
 	}
-	s.mu.Lock()
 	if err := s.flush(); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.compactLevel(0); err != nil {
 		t.Fatal(err)
 	}
-	s.mu.Unlock()
 
 	if len(s.levels[0]) != 0 {
 		t.Fatalf("%d tables left in L0 after compaction", len(s.levels[0]))
