@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 var (
@@ -35,10 +36,14 @@ type Options struct {
 	TableSize         int64
 }
 
-// Only the writer goroutine touches wal, walNum, memSize, nextNum, err, batches,
-// compactFrom and the byte counters. mu guards mem and levels, which readers also use;
-// the writer holds it only to apply a batch or swap in new tables, never across a WAL
-// fsync.
+// The writer goroutine owns wal, walNum, memSize, batches, userBytes and flushed. When
+// the memtable fills, the writer moves it to imm and starts a background job that
+// flushes it and then runs any compactions. That job owns logNum, compactFrom and
+// tableBytes, and the writer starts the next one only after the previous has finished.
+//
+// mu guards mem, imm, levels and err, which readers also use. Only the writer changes
+// mem and only the background job changes levels, so each reads its own without the
+// lock. Both hold it only to apply a batch or swap in tables, never across I/O.
 //
 // levels[0] holds flushed tables newest first, and their key ranges may overlap.
 // Every deeper level is a sorted run of non-overlapping tables. For any key, a version
@@ -54,14 +59,18 @@ type Store struct {
 
 	mu     sync.RWMutex
 	mem    map[string]Record
+	imm    map[string]Record
 	levels [][]*sstable
+	err    error
 
 	wal     *WAL
 	walNum  uint64
 	memSize int
-	nextNum uint64
-	err     error
 	batches int
+	flushed chan struct{}
+
+	nextNum atomic.Uint64
+	logNum  uint64
 
 	userBytes  int64
 	tableBytes int64
@@ -95,12 +104,11 @@ func Open(dir string, opts Options) (*Store, error) {
 		return nil, err
 	}
 	s := &Store{
-		dir:     dir,
-		opts:    opts,
-		writes:  make(chan writeReq),
-		quit:    make(chan struct{}),
-		mem:     map[string]Record{},
-		nextNum: 1,
+		dir:    dir,
+		opts:   opts,
+		writes: make(chan writeReq),
+		quit:   make(chan struct{}),
+		mem:    map[string]Record{},
 	}
 	if err := s.recover(ssts, wals); err != nil {
 		s.Close()
@@ -124,7 +132,13 @@ func (s *Store) recover(ssts, wals []uint64) error {
 	if !found && len(ssts) > 0 {
 		return fmt.Errorf("storage: SSTables exist but %s is missing", manifestName)
 	}
-	s.nextNum = slices.Max(slices.Concat(ssts, wals, m.tables(), []uint64{m.logNum})) + 1
+	if !found {
+		if err := writeManifest(s.dir, m); err != nil {
+			return err
+		}
+	}
+	s.nextNum.Store(slices.Max(slices.Concat(ssts, wals, m.tables(), []uint64{m.logNum})) + 1)
+	s.logNum = m.logNum
 
 	for _, num := range ssts {
 		if !slices.Contains(m.tables(), num) {
@@ -168,12 +182,12 @@ func (s *Store) recover(ssts, wals []uint64) error {
 }
 
 func (s *Store) openNewWAL() error {
-	wal, err := OpenWAL(s.path(s.nextNum, "wal"), func(Record) {})
+	num := s.nextNum.Add(1) - 1
+	wal, err := OpenWAL(s.path(num, "wal"), func(Record) {})
 	if err != nil {
 		return err
 	}
-	s.wal, s.walNum = wal, s.nextNum
-	s.nextNum++
+	s.wal, s.walNum = wal, num
 	return nil
 }
 
@@ -181,6 +195,9 @@ func (s *Store) Get(key []byte) ([]byte, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	rec, ok := s.mem[string(key)]
+	if !ok {
+		rec, ok = s.imm[string(key)]
+	}
 	for _, t := range s.candidates(key) {
 		if ok {
 			break
@@ -235,11 +252,13 @@ func (s *Store) Snapshot() (map[string][]byte, error) {
 			}
 		}
 	}
-	for key, rec := range s.mem {
-		if rec.Op == OpDelete {
-			delete(result, key)
-		} else {
-			result[key] = bytes.Clone(rec.Value)
+	for _, recs := range []map[string]Record{s.imm, s.mem} {
+		for key, rec := range recs {
+			if rec.Op == OpDelete {
+				delete(result, key)
+			} else {
+				result[key] = bytes.Clone(rec.Value)
+			}
 		}
 	}
 	return result, nil
@@ -301,16 +320,12 @@ func (s *Store) writeLoop() {
 }
 
 func (s *Store) commitBatch(batch []writeReq) error {
-	if s.err != nil {
-		return s.err
+	if err := s.failure(); err != nil {
+		return err
 	}
 	if s.memSize >= s.opts.MemtableSize {
-		s.mu.Lock()
-		err := s.flushAndCompact()
-		s.mu.Unlock()
-		if err != nil {
-			s.err = fmt.Errorf("storage: flush or compaction failed, store is read-only: %w", err)
-			return s.err
+		if err := s.rotate(); err != nil {
+			return err
 		}
 	}
 	recs := make([]Record, len(batch))
@@ -337,10 +352,59 @@ func (s *Store) apply(rec Record) {
 	s.memSize += len(rec.Key) + len(rec.Value)
 }
 
-func (s *Store) flushAndCompact() error {
-	if err := s.flush(); err != nil {
+func (s *Store) failure() error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.err
+}
+
+// A failed flush or compaction may have replaced the manifest without making it
+// durable, so a later commit built on the in-memory levels could drop live files.
+func (s *Store) fail(err error) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.err == nil {
+		s.err = fmt.Errorf("storage: flush or compaction failed, store is read-only: %w", err)
+	}
+	return s.err
+}
+
+func (s *Store) rotate() error {
+	if s.flushed != nil {
+		<-s.flushed
+		if err := s.failure(); err != nil {
+			return err
+		}
+	}
+	oldWAL, oldNum := s.wal, s.walNum
+	if err := s.openNewWAL(); err != nil {
+		return s.fail(err)
+	}
+	s.mu.Lock()
+	imm := s.mem
+	s.imm, s.mem = imm, map[string]Record{}
+	s.mu.Unlock()
+	s.memSize = 0
+	done := make(chan struct{})
+	s.flushed = done
+	s.done.Add(1)
+	go func() {
+		defer s.done.Done()
+		defer close(done)
+		if err := s.flushAndCompact(imm, oldWAL, oldNum); err != nil {
+			s.fail(err)
+		}
+	}()
+	return nil
+}
+
+func (s *Store) flushAndCompact(imm map[string]Record, wal *WAL, walNum uint64) error {
+	err := s.flush(imm, walNum)
+	wal.Close()
+	if err != nil {
 		return err
 	}
+	os.Remove(s.path(walNum, "wal"))
 	for {
 		level, ok := s.pickCompaction()
 		if !ok {
@@ -352,11 +416,9 @@ func (s *Store) flushAndCompact() error {
 	}
 }
 
-// Any failure here is fatal to the store: the manifest may already name the new WAL,
-// in which case recovery would discard the old one and lose writes appended to it.
-func (s *Store) flush() error {
-	recs := make([]Record, 0, len(s.mem))
-	for _, rec := range s.mem {
+func (s *Store) flush(imm map[string]Record, walNum uint64) error {
+	recs := make([]Record, 0, len(imm))
+	for _, rec := range imm {
 		recs = append(recs, rec)
 	}
 	slices.SortFunc(recs, func(a, b Record) int { return bytes.Compare(a.Key, b.Key) })
@@ -365,18 +427,15 @@ func (s *Store) flush() error {
 	if err != nil {
 		return err
 	}
-	oldWAL, oldNum := s.wal, s.walNum
-	if err := s.openNewWAL(); err != nil {
-		return err
-	}
 	levels := slices.Clone(s.levels)
 	levels[0] = append([]*sstable{table}, levels[0]...)
+	s.logNum = walNum + 1
 	if err := s.commit(levels); err != nil {
 		return err
 	}
-	s.mem, s.memSize = map[string]Record{}, 0
-	oldWAL.Close()
-	os.Remove(s.path(oldNum, "wal"))
+	s.mu.Lock()
+	s.imm = nil
+	s.mu.Unlock()
 	return nil
 }
 
@@ -551,7 +610,7 @@ func overlapsRange(t *sstable, lo, hi []byte) (bool, error) {
 }
 
 func (s *Store) commit(levels [][]*sstable) error {
-	m := manifest{logNum: s.walNum}
+	m := manifest{logNum: s.logNum}
 	for i, tables := range levels {
 		nums := make([]uint64, len(tables))
 		for j, t := range tables {
@@ -568,13 +627,14 @@ func (s *Store) commit(levels [][]*sstable) error {
 	if err := writeManifest(s.dir, m); err != nil {
 		return err
 	}
+	s.mu.Lock()
 	s.levels = levels
+	s.mu.Unlock()
 	return nil
 }
 
 func (s *Store) writeTable(recs []Record) (*sstable, error) {
-	num := s.nextNum
-	s.nextNum++
+	num := s.nextNum.Add(1) - 1
 	if err := writeSSTable(s.path(num, "sst"), recs); err != nil {
 		return nil, err
 	}

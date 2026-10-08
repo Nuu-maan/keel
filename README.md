@@ -17,7 +17,8 @@ The goal is correctness under failure first, then performance. Every durability 
 | Bloom filters | Done |
 | Manifest-based recovery | Done |
 | Leveled compaction with a streaming merge | Done |
-| Background flush and compaction | Planned ([#7](https://github.com/Nuu-maan/keel/issues/7)) |
+| Background flush behind an immutable memtable | Done |
+| Compaction separate from flush | Planned ([#33](https://github.com/Nuu-maan/keel/issues/33)) |
 | TCP wire protocol, server, client, CLI | Done |
 | Raft elections, log replication, quorum writes and reads | Done |
 | Snapshot transfer and catch-up | Done |
@@ -61,7 +62,7 @@ The three-node cluster follows this design. Cluster membership is currently fixe
 
 **Durability.** In standalone mode, a write is acknowledged after its WAL record is `fsync`ed. In cluster mode, the leader acknowledges only after a majority has durably stored the Raft entry and the leader has applied it. An acknowledged write survives the loss of a minority of nodes.
 
-**Group commit.** One writer goroutine owns the WAL. Each `Put` or `Delete` sends its record to that goroutine and waits. The writer takes every request already queued, appends the whole batch with one `write` and one `fsync`, applies it to the memtable, and then acknowledges each caller. Durability is unchanged, because nobody is acknowledged before the `fsync` that covers their record. The store lock is held only while applying a batch or swapping in new tables, never across an `fsync`, so reads don't wait on the disk.
+**Group commit.** One writer goroutine owns the WAL. Each `Put` or `Delete` sends its record to that goroutine and waits. The writer takes every request already queued, appends the whole batch with one `write` and one `fsync`, applies it to the memtable, and then acknowledges each caller. Durability is unchanged, because nobody is acknowledged before the `fsync` that covers their record. The store lock is held only while applying a batch or swapping in new tables, never across disk I/O, so reads don't wait on the disk.
 
 ![Write path: concurrent Puts are batched by the writer goroutine into one WAL write and fsync, applied to the memtable, flushed to SSTables and committed through the MANIFEST](docs/diagrams/write-path.png)
 
@@ -83,12 +84,13 @@ SSTables are checked the same way. The footer, the index and every data block ca
 
 **The manifest is the commit point.** A `MANIFEST` file lists the live SSTables in each level and the first WAL to replay. Flush and compaction never change live files in place. Each one writes its new files, then replaces the manifest atomically (write to `MANIFEST.tmp`, `fsync`, rename, `fsync` the directory). Until that rename lands, the old state is still complete, and afterwards the new one is.
 
-**Flush.** When the memtable reaches its size limit (4 MiB by default):
+**Flush.** When the memtable reaches its size limit (4 MiB by default), the writer:
 
-1. Write the sorted memtable to SSTable `N`, using the same atomic write.
-2. Open a new WAL, `N+1`.
-3. Commit a manifest that lists `N` and names `N+1` as the first WAL to replay.
-4. Delete the old WAL.
+1. Opens a new WAL, `N`, for the writes that follow.
+2. Keeps the full memtable as an immutable table, still visible to reads, and starts an empty one.
+3. Hands the immutable memtable to a background job.
+
+The job writes it to SSTable `M` with the same atomic write, commits a manifest that lists `M` and names `N` as the first WAL to replay, deletes the old WAL, and then runs any compactions that are due. Writes continue into the new memtable meanwhile. At most one immutable memtable exists, so if the new one fills before the job finishes, writes wait for it ([#33](https://github.com/Nuu-maan/keel/issues/33)).
 
 **Leveled compaction.** Tables live in levels:
 - **L0** holds flushed tables, newest first. Their key ranges may overlap.
@@ -116,11 +118,11 @@ As with flush, the new manifest is committed before any input is deleted.
 | SSTable not in the manifest | Output of an interrupted flush or compaction, or a leftover compaction input | Delete |
 | WAL below the manifest's log number | Already flushed | Delete without replaying. Replaying it would bring back overwritten values |
 | WAL at or above the log number | Holds unflushed writes | Replay into the memtable |
-| SSTables but no manifest | Unknown state | Refuse to open |
+| SSTables but no manifest | The manifest was lost. A new store writes an empty one before anything else | Refuse to open |
 
 Any error during flush or compaction makes the store read-only. After a partially applied manifest update, the store can't tell which WAL recovery will replay, so accepting more writes could lose them.
 
-**Reads.** `Get` checks the memtable first, then every L0 table from newest to oldest, then at most one table in each deeper level, found by binary search on the tables' key ranges. It stops at the first match. A tombstone means the key is deleted, even if an older table still holds a value. Each SSTable's bloom filter is checked before its index, so for a key the table doesn't contain, about 99% of lookups skip the disk read entirely.
+**Reads.** `Get` checks the memtable first, then the immutable memtable while it is being flushed, then every L0 table from newest to oldest, then at most one table in each deeper level, found by binary search on the tables' key ranges. It stops at the first match. A tombstone means the key is deleted, even if an older table still holds a value. Each SSTable's bloom filter is checked before its index, so for a key the table doesn't contain, about 99% of lookups skip the disk read entirely.
 
 ![Read path: Get checks the memtable, then each SSTable newest first; a bloom filter rules most tables out before the block index and a single pread](docs/diagrams/read-path.png)
 
@@ -199,6 +201,21 @@ Before, throughput was capped at one write per `fsync`, a few hundred to about 9
 KEEL_BENCH_DIR=/path/on/real/disk go test -run '^$' -bench Put ./storage/
 ```
 
+### Put latency
+
+`BenchmarkPutLatency` records the latency of each of 1M concurrent 100-byte puts from 128 goroutines with default options, so the run goes through about 25 flushes and their compactions. Each row gives the range over four interleaved runs on the same disk.
+
+| | p50 | p99 | p99.9 | Max |
+|---|---|---|---|---|
+| Inline flush | 1.9–2.2 ms | 16–18 ms | 86–221 ms | 0.64–0.97 s |
+| Background flush | 2.1–2.4 ms | 14–41 ms | 33–68 ms | 0.55–2.0 s |
+
+Moving the flush off the write path cuts p99.9 by 3–6×. The median and p99 are dominated by `fsync` time, which a flush doesn't change. The maximum is still high: the background job compacts after it flushes, and if the next memtable fills before that compaction finishes, writes wait for it ([#33](https://github.com/Nuu-maan/keel/issues/33)).
+
+```
+go test -run '^$' -bench PutLatency -benchtime 1000000x ./storage/
+```
+
 ### Write amplification
 
 `BenchmarkWriteAmplification` writes 100-byte values under random keys, drawn from a key space twice the number of writes. It then divides the bytes written to SSTables by the bytes the client wrote. The memtable is 256 KiB, with L1 at 1 MiB and 256 KiB output tables, scaled down from the defaults in the same proportion so the levels fill up quickly.
@@ -220,9 +237,9 @@ go test -run '^$' -bench WriteAmplification -benchtime 1x ./storage/
 Tests aim at failure modes, not just happy paths.
 
 - **Crash recovery.** The test re-runs its own binary as a writer subprocess that prints each key once `Put` returns. The parent sends `SIGKILL` after a random number of acknowledgements, reopens the store and checks every acknowledged key. This runs for 20 rounds. The memtable and compaction trigger are kept small, so kills also land in the middle of flushes, manifest commits and compactions.
-- **Mutation-checked.** Each durability test has been seen to fail against a deliberately broken store. Each of these mutations is caught: skipping WAL appends, replaying flushed WALs, deleting the live WAL, ignoring tombstones, keeping tombstones through compaction, dropping tombstones while a deeper level holds the key, reads skipping deeper levels, and compaction ignoring overlapping tables below. A durability test that can't fail proves nothing.
+- **Mutation-checked.** Each durability test has been seen to fail against a deliberately broken store. Each of these mutations is caught: skipping WAL appends, replaying flushed WALs, deleting the live WAL, ignoring tombstones, keeping tombstones through compaction, dropping tombstones while a deeper level holds the key, reads skipping deeper levels or a memtable that is being flushed, and compaction ignoring overlapping tables below. A durability test that can't fail proves nothing.
 - **Model-based.** 5000 random puts and deletes on a small memtable, so the run goes through many flushes and several reopens. Afterwards every key is checked against a plain Go map.
-- **Recovery rules.** A test plants a flushed WAL, an orphaned SSTable and a half-written `.tmp` file next to a manifest. Opening the store must delete all three and serve neither the stale nor the orphaned values. A store with SSTables but no manifest refuses to open.
+- **Recovery rules.** A test plants a flushed WAL, an orphaned SSTable and a half-written `.tmp` file next to a manifest. Opening the store must delete all three and serve neither the stale nor the orphaned values. A table left by a crash before the first manifest commit is deleted like any other orphan. A store with SSTables but no manifest refuses to open.
 - **Compaction.** Five rounds of overwrites and deletes over 100 keys are compacted from L0 into L1. L1 must hold exactly the 50 live keys at their latest values, with no tombstones, because nothing lies below it. The result must survive a reopen.
 - **Tombstone safety.** A key is pushed down to L2 by a trivial move, which the test also checks: the table is the same file, not a rewrite. The key is then deleted and the delete compacted into L1. The tombstone must survive, because L2 still holds the old value, and the key must stay deleted after a reopen.
 - **Level invariants.** After the model and compaction tests, a check confirms three things: L0 is below its trigger, every deeper level is sorted with no overlapping ranges, and the SSTable files on disk match the manifest exactly. The model test uses small level sizes, so it goes through L2 and deeper.
@@ -255,12 +272,12 @@ storage/
   bloom.go     bloom filter
   merge.go     k-way merge iterator; the newest source wins
   manifest.go  live-file manifest, replaced atomically
-  store.go     memtable, flush, leveled compaction, recovery, read path
+  store.go     memtable, background flush, leveled compaction, recovery, read path
 ```
 
 ## Roadmap
 
-1. **Storage engine.** Background flush and compaction ([#7](https://github.com/Nuu-maan/keel/issues/7)).
+1. **Storage engine.** Compaction on its own goroutine, so a long compaction no longer stalls writes ([#33](https://github.com/Nuu-maan/keel/issues/33)).
 2. **Raft.** Fixed-membership replication is operational. Segmented logs and chunked snapshots ([#24](https://github.com/Nuu-maan/keel/issues/24)), then membership changes ([#25](https://github.com/Nuu-maan/keel/issues/25)).
 3. **Chaos testing** ([#26](https://github.com/Nuu-maan/keel/issues/26)). Process kills, `SIGSTOP`, network partitions with `iptables`, latency with `tc netem`. Recorded histories checked for linearizability with [Porcupine](https://github.com/anishathalye/porcupine).
 4. **Observability.** Prometheus metrics for latency histograms, `fsync` time, replication lag and elections.

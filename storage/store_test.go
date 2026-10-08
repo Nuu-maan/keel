@@ -82,8 +82,8 @@ func TestCrashRecovery(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.Close()
-	if s.nextNum < 20 {
-		t.Fatalf("only %d files ever created, so crashes during flush and compaction were barely exercised", s.nextNum)
+	if s.nextNum.Load() < 20 {
+		t.Fatalf("only %d files ever created, so crashes during flush and compaction were barely exercised", s.nextNum.Load())
 	}
 }
 
@@ -239,6 +239,31 @@ func TestOpenRefusesSSTablesWithoutManifest(t *testing.T) {
 	}
 }
 
+func TestOpenDeletesTableLeftByFirstFlush(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(dir, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Put([]byte("k"), []byte("v"))
+	s.Close()
+	if err := writeSSTable(filepath.Join(dir, "000099.sst"), []Record{{Op: OpPut, Key: []byte("k"), Value: []byte("v")}}); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err = Open(dir, Options{})
+	if err != nil {
+		t.Fatalf("a crash before the first manifest commit left an unopenable store: %v", err)
+	}
+	defer s.Close()
+	if v, err := s.Get([]byte("k")); err != nil || string(v) != "v" {
+		t.Fatalf("k = %q, %v", v, err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "000099.sst")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("orphaned table should have been removed, stat err = %v", err)
+	}
+}
+
 func TestCompactionDropsOverwritesAndTombstones(t *testing.T) {
 	dir := t.TempDir()
 	opts := Options{MemtableSize: 1 << 10, CompactionTrigger: 1000}
@@ -261,14 +286,12 @@ func TestCompactionDropsOverwritesAndTombstones(t *testing.T) {
 			}
 		}
 	}
-	s.mu.Lock()
-	if err := s.flush(); err != nil {
+	if err := flushMemtable(s); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.compactLevel(0); err != nil {
 		t.Fatal(err)
 	}
-	s.mu.Unlock()
 
 	if len(s.levels[0]) != 0 {
 		t.Fatalf("%d tables left in L0 after compaction", len(s.levels[0]))
@@ -323,6 +346,25 @@ func TestConcurrentWritesShareBatches(t *testing.T) {
 	for i := range writers {
 		if _, err := s.Get(fmt.Appendf(nil, "k%d", i)); err != nil {
 			t.Fatalf("k%d: %v", i, err)
+		}
+	}
+}
+
+func TestReadsSeeMemtableWhileItFlushes(t *testing.T) {
+	s, err := Open(t.TempDir(), Options{MemtableSize: 1, CompactionTrigger: 1000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	for i := range 200 {
+		if err := s.Put(fmt.Appendf(nil, "k%d", i), []byte("v")); err != nil {
+			t.Fatal(err)
+		}
+		if i == 0 {
+			continue
+		}
+		if _, err := s.Get(fmt.Appendf(nil, "k%d", i-1)); err != nil {
+			t.Fatalf("k%d, written before the memtable was swapped out: %v", i-1, err)
 		}
 	}
 }
