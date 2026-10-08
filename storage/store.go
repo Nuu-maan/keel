@@ -36,7 +36,7 @@ type Options struct {
 	TableSize         int64
 }
 
-// Only the writer goroutine touches wal, walNum, memSize, err, batches,
+// Only the writer goroutine touches wal, walNum, logNum, memSize, err, batches,
 // compactFrom and the byte counters. mu guards mem and levels, which readers also use;
 // the writer holds it only to apply a batch or swap in new tables, never across a WAL
 // fsync.
@@ -59,6 +59,7 @@ type Store struct {
 
 	wal     *WAL
 	walNum  uint64
+	logNum  uint64
 	memSize int
 	nextNum atomic.Uint64
 	err     error
@@ -125,6 +126,7 @@ func (s *Store) recover(ssts, wals []uint64) error {
 		return fmt.Errorf("storage: SSTables exist but %s is missing", manifestName)
 	}
 	s.nextNum.Store(slices.Max(slices.Concat(ssts, wals, m.tables(), []uint64{m.logNum})) + 1)
+	s.logNum = m.logNum
 
 	for _, num := range ssts {
 		if !slices.Contains(m.tables(), num) {
@@ -371,6 +373,7 @@ func (s *Store) flush() error {
 	}
 	levels := slices.Clone(s.levels)
 	levels[0] = append([]*sstable{table}, levels[0]...)
+	s.logNum = oldNum + 1
 	if err := s.commit(levels); err != nil {
 		return err
 	}
@@ -551,7 +554,7 @@ func overlapsRange(t *sstable, lo, hi []byte) (bool, error) {
 }
 
 func (s *Store) commit(levels [][]*sstable) error {
-	m := manifest{logNum: s.walNum}
+	m := manifest{logNum: s.logNum}
 	for i, tables := range levels {
 		nums := make([]uint64, len(tables))
 		for j, t := range tables {
