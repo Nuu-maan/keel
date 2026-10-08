@@ -82,8 +82,8 @@ func TestCrashRecovery(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.Close()
-	if s.nextNum < 20 {
-		t.Fatalf("only %d files ever created, so crashes during flush and compaction were barely exercised", s.nextNum)
+	if s.nextNum.Load() < 20 {
+		t.Fatalf("only %d files ever created, so crashes during flush and compaction were barely exercised", s.nextNum.Load())
 	}
 }
 

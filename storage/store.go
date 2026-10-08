@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 var (
@@ -35,7 +36,7 @@ type Options struct {
 	TableSize         int64
 }
 
-// Only the writer goroutine touches wal, walNum, memSize, nextNum, err, batches,
+// Only the writer goroutine touches wal, walNum, memSize, err, batches,
 // compactFrom and the byte counters. mu guards mem and levels, which readers also use;
 // the writer holds it only to apply a batch or swap in new tables, never across a WAL
 // fsync.
@@ -59,7 +60,7 @@ type Store struct {
 	wal     *WAL
 	walNum  uint64
 	memSize int
-	nextNum uint64
+	nextNum atomic.Uint64
 	err     error
 	batches int
 
@@ -95,12 +96,11 @@ func Open(dir string, opts Options) (*Store, error) {
 		return nil, err
 	}
 	s := &Store{
-		dir:     dir,
-		opts:    opts,
-		writes:  make(chan writeReq),
-		quit:    make(chan struct{}),
-		mem:     map[string]Record{},
-		nextNum: 1,
+		dir:    dir,
+		opts:   opts,
+		writes: make(chan writeReq),
+		quit:   make(chan struct{}),
+		mem:    map[string]Record{},
 	}
 	if err := s.recover(ssts, wals); err != nil {
 		s.Close()
@@ -124,7 +124,7 @@ func (s *Store) recover(ssts, wals []uint64) error {
 	if !found && len(ssts) > 0 {
 		return fmt.Errorf("storage: SSTables exist but %s is missing", manifestName)
 	}
-	s.nextNum = slices.Max(slices.Concat(ssts, wals, m.tables(), []uint64{m.logNum})) + 1
+	s.nextNum.Store(slices.Max(slices.Concat(ssts, wals, m.tables(), []uint64{m.logNum})) + 1)
 
 	for _, num := range ssts {
 		if !slices.Contains(m.tables(), num) {
@@ -168,12 +168,12 @@ func (s *Store) recover(ssts, wals []uint64) error {
 }
 
 func (s *Store) openNewWAL() error {
-	wal, err := OpenWAL(s.path(s.nextNum, "wal"), func(Record) {})
+	num := s.nextNum.Add(1) - 1
+	wal, err := OpenWAL(s.path(num, "wal"), func(Record) {})
 	if err != nil {
 		return err
 	}
-	s.wal, s.walNum = wal, s.nextNum
-	s.nextNum++
+	s.wal, s.walNum = wal, num
 	return nil
 }
 
@@ -573,8 +573,7 @@ func (s *Store) commit(levels [][]*sstable) error {
 }
 
 func (s *Store) writeTable(recs []Record) (*sstable, error) {
-	num := s.nextNum
-	s.nextNum++
+	num := s.nextNum.Add(1) - 1
 	if err := writeSSTable(s.path(num, "sst"), recs); err != nil {
 		return nil, err
 	}
