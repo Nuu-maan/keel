@@ -6,8 +6,11 @@ import (
 	"math/rand/v2"
 	"os"
 	"runtime"
+	"slices"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // Not b.TempDir: /tmp is often tmpfs, where fsync is free and the numbers mean nothing.
@@ -52,6 +55,42 @@ func BenchmarkPut(b *testing.B) {
 				}
 			})
 		})
+	}
+}
+
+func BenchmarkPutLatency(b *testing.B) {
+	s, err := Open(benchDir(b), Options{})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer s.Close()
+	value := make([]byte, 100)
+	var seq atomic.Int64
+	var mu sync.Mutex
+	var latencies []time.Duration
+	b.SetParallelism(16)
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		var local []time.Duration
+		for pb.Next() {
+			start := time.Now()
+			if err := s.Put(fmt.Appendf(nil, "key-%d", seq.Add(1)), value); err != nil {
+				b.Error(err)
+				return
+			}
+			local = append(local, time.Since(start))
+		}
+		mu.Lock()
+		latencies = append(latencies, local...)
+		mu.Unlock()
+	})
+	b.StopTimer()
+	slices.Sort(latencies)
+	for _, q := range []struct {
+		unit     string
+		quantile float64
+	}{{"p50-µs", 0.5}, {"p99-µs", 0.99}, {"p99.9-µs", 0.999}, {"max-µs", 1}} {
+		b.ReportMetric(float64(latencies[int(q.quantile*float64(len(latencies)-1))].Microseconds()), q.unit)
 	}
 }
 
