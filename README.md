@@ -201,6 +201,21 @@ Before, throughput was capped at one write per `fsync`, a few hundred to about 9
 KEEL_BENCH_DIR=/path/on/real/disk go test -run '^$' -bench Put ./storage/
 ```
 
+### Put latency
+
+`BenchmarkPutLatency` records the latency of each of 1M concurrent 100-byte puts from 128 goroutines with default options, so the run goes through about 25 flushes and their compactions. Each row gives the range over four interleaved runs on the same disk.
+
+| | p50 | p99 | p99.9 | Max |
+|---|---|---|---|---|
+| Inline flush | 1.9–2.2 ms | 16–18 ms | 86–221 ms | 0.64–0.97 s |
+| Background flush | 2.1–2.4 ms | 14–41 ms | 33–68 ms | 0.55–2.0 s |
+
+Moving the flush off the write path cuts p99.9 by 3–6×. The median and p99 are dominated by `fsync` time, which a flush doesn't change. The maximum is still high: the background job compacts after it flushes, and if the next memtable fills before that compaction finishes, writes wait for it ([#33](https://github.com/Nuu-maan/keel/issues/33)).
+
+```
+go test -run '^$' -bench PutLatency -benchtime 1000000x ./storage/
+```
+
 ### Write amplification
 
 `BenchmarkWriteAmplification` writes 100-byte values under random keys, drawn from a key space twice the number of writes. It then divides the bytes written to SSTables by the bytes the client wrote. The memtable is 256 KiB, with L1 at 1 MiB and 256 KiB output tables, scaled down from the defaults in the same proportion so the levels fill up quickly.
