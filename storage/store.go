@@ -125,6 +125,11 @@ func (s *Store) recover(ssts, wals []uint64) error {
 	if !found && len(ssts) > 0 {
 		return fmt.Errorf("storage: SSTables exist but %s is missing", manifestName)
 	}
+	if !found {
+		if err := writeManifest(s.dir, m); err != nil {
+			return err
+		}
+	}
 	s.nextNum.Store(slices.Max(slices.Concat(ssts, wals, m.tables(), []uint64{m.logNum})) + 1)
 	s.logNum = m.logNum
 

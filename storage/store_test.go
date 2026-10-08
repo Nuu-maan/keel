@@ -239,6 +239,31 @@ func TestOpenRefusesSSTablesWithoutManifest(t *testing.T) {
 	}
 }
 
+func TestOpenDeletesTableLeftByFirstFlush(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(dir, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Put([]byte("k"), []byte("v"))
+	s.Close()
+	if err := writeSSTable(filepath.Join(dir, "000099.sst"), []Record{{Op: OpPut, Key: []byte("k"), Value: []byte("v")}}); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err = Open(dir, Options{})
+	if err != nil {
+		t.Fatalf("a crash before the first manifest commit left an unopenable store: %v", err)
+	}
+	defer s.Close()
+	if v, err := s.Get([]byte("k")); err != nil || string(v) != "v" {
+		t.Fatalf("k = %q, %v", v, err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "000099.sst")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("orphaned table should have been removed, stat err = %v", err)
+	}
+}
+
 func TestCompactionDropsOverwritesAndTombstones(t *testing.T) {
 	dir := t.TempDir()
 	opts := Options{MemtableSize: 1 << 10, CompactionTrigger: 1000}
