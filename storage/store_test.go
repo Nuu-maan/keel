@@ -286,7 +286,7 @@ func TestCompactionDropsOverwritesAndTombstones(t *testing.T) {
 			}
 		}
 	}
-	if err := s.flush(); err != nil {
+	if err := flushMemtable(s); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.compactLevel(0); err != nil {
@@ -346,6 +346,25 @@ func TestConcurrentWritesShareBatches(t *testing.T) {
 	for i := range writers {
 		if _, err := s.Get(fmt.Appendf(nil, "k%d", i)); err != nil {
 			t.Fatalf("k%d: %v", i, err)
+		}
+	}
+}
+
+func TestReadsSeeMemtableWhileItFlushes(t *testing.T) {
+	s, err := Open(t.TempDir(), Options{MemtableSize: 1, CompactionTrigger: 1000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	for i := range 200 {
+		if err := s.Put(fmt.Appendf(nil, "k%d", i), []byte("v")); err != nil {
+			t.Fatal(err)
+		}
+		if i == 0 {
+			continue
+		}
+		if _, err := s.Get(fmt.Appendf(nil, "k%d", i-1)); err != nil {
+			t.Fatalf("k%d, written before the memtable was swapped out: %v", i-1, err)
 		}
 	}
 }

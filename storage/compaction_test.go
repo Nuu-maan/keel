@@ -32,6 +32,15 @@ func checkLevels(t *testing.T, s *Store) {
 	}
 }
 
+// Safe only while no Put or Delete is in flight: rotate belongs to the writer goroutine.
+func flushMemtable(s *Store) error {
+	if err := s.rotate(); err != nil {
+		return err
+	}
+	<-s.flushed
+	return s.failure()
+}
+
 func levelRecords(t *testing.T, tables []*sstable) []Record {
 	t.Helper()
 	var recs []Record
@@ -63,7 +72,7 @@ func TestCompactionKeepsTombstoneWhileDeeperLevelHoldsKey(t *testing.T) {
 	if err := s.Put([]byte("k"), []byte("old")); err != nil {
 		t.Fatal(err)
 	}
-	step(s.flush)
+	step(func() error { return flushMemtable(s) })
 	step(func() error { return s.compactLevel(0) })
 	moved := s.levels[1][0].num
 	step(func() error { return s.compactLevel(1) })
@@ -77,11 +86,11 @@ func TestCompactionKeepsTombstoneWhileDeeperLevelHoldsKey(t *testing.T) {
 	if err := s.Put([]byte("other"), []byte("v")); err != nil {
 		t.Fatal(err)
 	}
-	step(s.flush)
+	step(func() error { return flushMemtable(s) })
 	if err := s.Put([]byte("k0"), []byte("v")); err != nil {
 		t.Fatal(err)
 	}
-	step(s.flush)
+	step(func() error { return flushMemtable(s) })
 	step(func() error { return s.compactLevel(0) })
 
 	recs := levelRecords(t, s.levels[1])
