@@ -116,7 +116,7 @@ As with flush, the new manifest is committed before any input is deleted.
 | SSTable not in the manifest | Output of an interrupted flush or compaction, or a leftover compaction input | Delete |
 | WAL below the manifest's log number | Already flushed | Delete without replaying. Replaying it would bring back overwritten values |
 | WAL at or above the log number | Holds unflushed writes | Replay into the memtable |
-| SSTables but no manifest | Unknown state | Refuse to open |
+| SSTables but no manifest | The manifest was lost. A new store writes an empty one before anything else | Refuse to open |
 
 Any error during flush or compaction makes the store read-only. After a partially applied manifest update, the store can't tell which WAL recovery will replay, so accepting more writes could lose them.
 
@@ -222,7 +222,7 @@ Tests aim at failure modes, not just happy paths.
 - **Crash recovery.** The test re-runs its own binary as a writer subprocess that prints each key once `Put` returns. The parent sends `SIGKILL` after a random number of acknowledgements, reopens the store and checks every acknowledged key. This runs for 20 rounds. The memtable and compaction trigger are kept small, so kills also land in the middle of flushes, manifest commits and compactions.
 - **Mutation-checked.** Each durability test has been seen to fail against a deliberately broken store. Each of these mutations is caught: skipping WAL appends, replaying flushed WALs, deleting the live WAL, ignoring tombstones, keeping tombstones through compaction, dropping tombstones while a deeper level holds the key, reads skipping deeper levels, and compaction ignoring overlapping tables below. A durability test that can't fail proves nothing.
 - **Model-based.** 5000 random puts and deletes on a small memtable, so the run goes through many flushes and several reopens. Afterwards every key is checked against a plain Go map.
-- **Recovery rules.** A test plants a flushed WAL, an orphaned SSTable and a half-written `.tmp` file next to a manifest. Opening the store must delete all three and serve neither the stale nor the orphaned values. A store with SSTables but no manifest refuses to open.
+- **Recovery rules.** A test plants a flushed WAL, an orphaned SSTable and a half-written `.tmp` file next to a manifest. Opening the store must delete all three and serve neither the stale nor the orphaned values. A table left by a crash before the first manifest commit is deleted like any other orphan. A store with SSTables but no manifest refuses to open.
 - **Compaction.** Five rounds of overwrites and deletes over 100 keys are compacted from L0 into L1. L1 must hold exactly the 50 live keys at their latest values, with no tombstones, because nothing lies below it. The result must survive a reopen.
 - **Tombstone safety.** A key is pushed down to L2 by a trivial move, which the test also checks: the table is the same file, not a rewrite. The key is then deleted and the delete compacted into L1. The tombstone must survive, because L2 still holds the old value, and the key must stay deleted after a reopen.
 - **Level invariants.** After the model and compaction tests, a check confirms three things: L0 is below its trigger, every deeper level is sorted with no overlapping ranges, and the SSTable files on disk match the manifest exactly. The model test uses small level sizes, so it goes through L2 and deeper.
