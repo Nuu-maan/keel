@@ -38,8 +38,8 @@ type Options struct {
 
 // The writer goroutine owns wal, walNum, memSize, batches, userBytes and flushed. When
 // the memtable fills, the writer moves it to imm and starts a background job that
-// flushes it and then runs any compactions. That job owns logNum, compactFrom and
-// tableBytes, and the writer starts the next one only after the previous has finished.
+// flushes it and then runs any compactions. That job owns logNum and compactFrom, and
+// the writer starts the next one only after the previous has finished.
 //
 // mu guards mem, imm, levels and err, which readers also use. Only the writer changes
 // mem and only the background job changes levels, so each reads its own without the
@@ -73,7 +73,7 @@ type Store struct {
 	logNum  uint64
 
 	userBytes  int64
-	tableBytes int64
+	tableBytes atomic.Int64
 
 	compactFrom [maxLevels][]byte
 }
@@ -642,7 +642,7 @@ func (s *Store) writeTable(recs []Record) (*sstable, error) {
 	if err != nil {
 		return nil, err
 	}
-	s.tableBytes += table.size
+	s.tableBytes.Add(table.size)
 	return table, nil
 }
 
