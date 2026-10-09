@@ -3,9 +3,12 @@ package storage
 import (
 	"bytes"
 	"errors"
+	"fmt"
+	"math/rand/v2"
 	"path/filepath"
 	"slices"
 	"testing"
+	"time"
 )
 
 func checkLevels(t *testing.T, s *Store) {
@@ -105,5 +108,83 @@ func TestCompactionKeepsTombstoneWhileDeeperLevelHoldsKey(t *testing.T) {
 	}
 	if _, err := s.Get([]byte("k")); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("deleted key resurrected from L2: %v", err)
+	}
+}
+
+func TestWritesStopWhileL0IsFull(t *testing.T) {
+	opts := Options{MemtableSize: 1 << 10, CompactionTrigger: 2, LevelSize: 1 << 20}
+	s, err := Open(t.TempDir(), opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	limit := l0StopFactor * opts.CompactionTrigger
+	value := make([]byte, 100)
+	rng := rand.New(rand.NewPCG(1, 2))
+	for range 5000 {
+		if err := s.Put(fmt.Appendf(nil, "k%06d", rng.IntN(100000)), value); err != nil {
+			t.Fatal(err)
+		}
+		if n := len(s.version()[0]); n > limit {
+			t.Fatalf("L0 holds %d tables, writes should have stopped at %d", n, limit)
+		}
+	}
+}
+
+func TestOpenCompactsFullL0(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(dir, Options{CompactionTrigger: 1000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts := Options{MemtableSize: 1, CompactionTrigger: 2}
+	for i := range l0StopFactor * opts.CompactionTrigger {
+		if err := s.Put(fmt.Appendf(nil, "k%d", i), []byte("v")); err != nil {
+			t.Fatal(err)
+		}
+		if err := flushMemtable(s); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s.Close()
+
+	if s, err = Open(dir, opts); err != nil {
+		t.Fatal(err)
+	}
+	written := make(chan error, 1)
+	go func() {
+		err := s.Put([]byte("a"), []byte("v"))
+		if err == nil {
+			err = s.Put([]byte("b"), []byte("v"))
+		}
+		written <- err
+	}()
+	select {
+	case err := <-written:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("writes stopped for a full L0 that nothing compacts")
+	}
+	s.Close()
+}
+
+func TestDeeperLevelsKeepUpWithSteadyWrites(t *testing.T) {
+	opts := Options{MemtableSize: 1 << 10, CompactionTrigger: 2, LevelSize: 16 << 10, TableSize: 4 << 10}
+	s, err := Open(t.TempDir(), opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	value := make([]byte, 100)
+	rng := rand.New(rand.NewPCG(1, 2))
+	for range 10000 {
+		if err := s.Put(fmt.Appendf(nil, "k%06d", rng.IntN(100000)), value); err != nil {
+			t.Fatal(err)
+		}
+		if n := levelBytes(s.version()[1]); n > 10*opts.LevelSize {
+			t.Fatalf("L1 holds %d bytes against a limit of %d: L0 compactions starve it", n, opts.LevelSize)
+		}
 	}
 }

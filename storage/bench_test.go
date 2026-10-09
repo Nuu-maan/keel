@@ -111,7 +111,7 @@ func BenchmarkWriteAmplification(b *testing.B) {
 					}
 				}
 				s.Close()
-				b.ReportMetric(float64(s.tableBytes)/float64(s.userBytes), "write-amp")
+				b.ReportMetric(float64(s.tableBytes.Load())/float64(s.userBytes), "write-amp")
 			}
 		})
 	}
