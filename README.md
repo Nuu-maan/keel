@@ -18,7 +18,7 @@ The goal is correctness under failure first, then performance. Every durability 
 | Manifest-based recovery | Done |
 | Leveled compaction with a streaming merge | Done |
 | Background flush behind an immutable memtable | Done |
-| Compaction separate from flush | Planned ([#33](https://github.com/Nuu-maan/keel/issues/33)) |
+| Background compaction | Done |
 | TCP wire protocol, server, client, CLI | Done |
 | Raft elections, log replication, quorum writes and reads | Done |
 | Snapshot transfer and catch-up | Done |
@@ -90,7 +90,7 @@ SSTables are checked the same way. The footer, the index and every data block ca
 2. Keeps the full memtable as an immutable table, still visible to reads, and starts an empty one.
 3. Hands the immutable memtable to a background job.
 
-The job writes it to SSTable `M` with the same atomic write, commits a manifest that lists `M` and names `N` as the first WAL to replay, deletes the old WAL, and then runs any compactions that are due. Writes continue into the new memtable meanwhile. At most one immutable memtable exists, so if the new one fills before the job finishes, writes wait for it ([#33](https://github.com/Nuu-maan/keel/issues/33)).
+The job writes it to SSTable `M` with the same atomic write, commits a manifest that lists `M` and names `N` as the first WAL to replay, deletes the old WAL, and wakes the compactor. Writes continue into the new memtable meanwhile. At most one immutable memtable exists, so if the new one fills before the job finishes, writes wait for it.
 
 **Leveled compaction.** Tables live in levels:
 - **L0** holds flushed tables, newest first. Their key ranges may overlap.
@@ -103,12 +103,15 @@ A version in a shallower level is always newer than one in a deeper level.
 - **Streaming merge.** Inputs are read block by block through a k-way merge (`container/heap`), and output is cut into tables of about 2 MiB, so memory stays bounded regardless of database size.
 - **Trivial move.** A table that overlaps nothing in the next level moves down by a manifest update alone, with no rewrite.
 - **Tombstones.** A tombstone is dropped only when no level below the output overlaps the merged key range. If one did, dropping the tombstone would let an older value in that level come back.
+- **Background.** One compactor goroutine runs compactions while writes and flushes continue. Each commit applies its change to the levels as they are at that moment, so tables flushed into L0 during a merge stay above its output.
+- **Scheduling.** The compactor picks the level furthest past its limit: L0 by table count against its trigger, deeper levels by size against theirs. Always preferring L0 would starve L1 under steady writes, and every L0 compaction would then rewrite all of it.
+- **Write stop.** While L0 holds 12 tables, three times its trigger, writes wait for compaction. This bounds read amplification and the size of the next L0 compaction.
 
 As with flush, the new manifest is committed before any input is deleted.
 
 ![Leveled compaction: L0 tables overlap; L1 and deeper are sorted runs, each ten times larger; an L0 compaction merges into the overlapping L1 tables, and a deeper compaction moves one table at a time](docs/diagrams/compaction.png)
 
-**Recovery** follows the manifest and deletes whatever it doesn't reference:
+**Recovery** follows the manifest and deletes whatever it doesn't reference, then wakes the compactor in case the crash left a compaction due:
 
 ![Recovery: files listed in the MANIFEST are kept, WALs at or above its log number are replayed, and everything else is deleted](docs/diagrams/recovery.png)
 
@@ -242,6 +245,7 @@ Tests aim at failure modes, not just happy paths.
 - **Recovery rules.** A test plants a flushed WAL, an orphaned SSTable and a half-written `.tmp` file next to a manifest. Opening the store must delete all three and serve neither the stale nor the orphaned values. A table left by a crash before the first manifest commit is deleted like any other orphan. A store with SSTables but no manifest refuses to open.
 - **Compaction.** Five rounds of overwrites and deletes over 100 keys are compacted from L0 into L1. L1 must hold exactly the 50 live keys at their latest values, with no tombstones, because nothing lies below it. The result must survive a reopen.
 - **Tombstone safety.** A key is pushed down to L2 by a trivial move, which the test also checks: the table is the same file, not a rewrite. The key is then deleted and the delete compacted into L1. The tombstone must survive, because L2 still holds the old value, and the key must stay deleted after a reopen.
+- **Compaction scheduling.** Under steady writes, L0 must never hold more than three times its trigger, and L1 must never grow past ten times its limit. Each check fails when the write stop or the level scoring is removed. A store reopened with a full L0 must compact it instead of stalling the first write.
 - **Level invariants.** After the model and compaction tests, a check confirms three things: L0 is below its trigger, every deeper level is sorted with no overlapping ranges, and the SSTable files on disk match the manifest exactly. The model test uses small level sizes, so it goes through L2 and deeper.
 - **Torn writes and corruption.** For the WAL: partial headers, partial payloads, zero-filled tails and a damaged last record are recovered. A damaged checksum, length or payload in the middle of the file is rejected. For SSTables: damaged blocks, filter, index, footer and magic number are all detected.
 - **Filter effectiveness.** A test fills an SSTable's data blocks with garbage but leaves the filter and index intact. Lookups for absent keys still succeed, because the filter stops them before any block is read. With the filter disabled, 1999 of 2000 of those lookups read a block.
@@ -277,7 +281,7 @@ storage/
 
 ## Roadmap
 
-1. **Storage engine.** Compaction on its own goroutine, so a long compaction no longer stalls writes ([#33](https://github.com/Nuu-maan/keel/issues/33)).
+1. **Storage engine.** Keep background table writes from slowing WAL `fsync` ([#36](https://github.com/Nuu-maan/keel/issues/36)).
 2. **Raft.** Fixed-membership replication is operational. Segmented logs and chunked snapshots ([#24](https://github.com/Nuu-maan/keel/issues/24)), then membership changes ([#25](https://github.com/Nuu-maan/keel/issues/25)).
 3. **Chaos testing** ([#26](https://github.com/Nuu-maan/keel/issues/26)). Process kills, `SIGSTOP`, network partitions with `iptables`, latency with `tc netem`. Recorded histories checked for linearizability with [Porcupine](https://github.com/anishathalye/porcupine).
 4. **Observability.** Prometheus metrics for latency histograms, `fsync` time, replication lag and elections.
