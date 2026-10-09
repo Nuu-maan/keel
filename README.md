@@ -206,14 +206,15 @@ KEEL_BENCH_DIR=/path/on/real/disk go test -run '^$' -bench Put ./storage/
 
 ### Put latency
 
-`BenchmarkPutLatency` records the latency of each of 1M concurrent 100-byte puts from 128 goroutines with default options, so the run goes through about 25 flushes and their compactions. Each row gives the range over four interleaved runs on the same disk.
+`BenchmarkPutLatency` records the latency of each of 1M concurrent 100-byte puts from 128 goroutines with default options, so the run goes through about 25 flushes and their compactions. Each row gives the range over four runs, interleaved with runs of the row above it on the same disk.
 
 | | p50 | p99 | p99.9 | Max |
 |---|---|---|---|---|
 | Inline flush | 1.9–2.2 ms | 16–18 ms | 86–221 ms | 0.64–0.97 s |
 | Background flush | 2.1–2.4 ms | 14–41 ms | 33–68 ms | 0.55–2.0 s |
+| Background compaction | 1.9–2.7 ms | 12–23 ms | 29–56 ms | 0.09–2.2 s |
 
-Moving the flush off the write path cuts p99.9 by 3–6×. The median and p99 are dominated by `fsync` time, which a flush doesn't change. The maximum is still high: the background job compacts after it flushes, and if the next memtable fills before that compaction finishes, writes wait for it ([#33](https://github.com/Nuu-maan/keel/issues/33)).
+Moving the flush off the write path cuts p99.9 by 3–6×. The median and p99 are dominated by `fsync` time, which a flush doesn't change. Moving compaction to its own goroutine removes the last place a write waits for background work: in an instrumented run, no write waited more than 30 ms for a flush or for the L0 write stop. The latency ranges still overlap the previous row's, because what remains of the tail is the WAL `fsync` itself. It slows to hundreds of milliseconds while SSTable writes compete for the disk ([#36](https://github.com/Nuu-maan/keel/issues/36)).
 
 ```
 go test -run '^$' -bench PutLatency -benchtime 1000000x ./storage/
@@ -230,6 +231,8 @@ go test -run '^$' -bench PutLatency -benchtime 1000000x ./storage/
 | 128 MiB | 76.0× | 13.2× | 288 s → 35 s |
 
 Full compaction rewrites every live byte each time it runs, so its write amplification grows in proportion to the database. Leveled compaction rewrites a byte about once per level it passes through, so its amplification grows with the number of levels, which is logarithmic in the database size.
+
+Running compaction in the background lowers it further, to 5.7–5.9×, 7.1–7.6× and 9.2–9.3× over three runs. Writes keep flushing while a compaction runs, so an L0 compaction merges 4 to 12 tables at once instead of always 4, and L1 is rewritten about half as often. In the same session, the 128 MiB run took 10–13 s, against 15 s with compaction inline.
 
 ```
 go test -run '^$' -bench WriteAmplification -benchtime 1x ./storage/
