@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"slices"
 	"testing"
+	"time"
 )
 
 func checkLevels(t *testing.T, s *Store) {
@@ -128,4 +129,43 @@ func TestWritesStopWhileL0IsFull(t *testing.T) {
 			t.Fatalf("L0 holds %d tables, writes should have stopped at %d", n, limit)
 		}
 	}
+}
+
+func TestOpenCompactsFullL0(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(dir, Options{CompactionTrigger: 1000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts := Options{MemtableSize: 1, CompactionTrigger: 2}
+	for i := range l0StopFactor * opts.CompactionTrigger {
+		if err := s.Put(fmt.Appendf(nil, "k%d", i), []byte("v")); err != nil {
+			t.Fatal(err)
+		}
+		if err := flushMemtable(s); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s.Close()
+
+	if s, err = Open(dir, opts); err != nil {
+		t.Fatal(err)
+	}
+	written := make(chan error, 1)
+	go func() {
+		err := s.Put([]byte("a"), []byte("v"))
+		if err == nil {
+			err = s.Put([]byte("b"), []byte("v"))
+		}
+		written <- err
+	}()
+	select {
+	case err := <-written:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("writes stopped for a full L0 that nothing compacts")
+	}
+	s.Close()
 }

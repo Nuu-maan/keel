@@ -132,6 +132,7 @@ func Open(dir string, opts Options) (*Store, error) {
 	go s.writeLoop()
 	s.compactor.Add(1)
 	go s.compactLoop()
+	notify(s.compactWake)
 	return s, nil
 }
 
