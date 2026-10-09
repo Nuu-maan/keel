@@ -38,12 +38,13 @@ type Options struct {
 
 // The writer goroutine owns wal, walNum, memSize, batches, userBytes and flushed. When
 // the memtable fills, the writer moves it to imm and starts a background job that
-// flushes it and then runs any compactions. That job owns logNum and compactFrom, and
-// the writer starts the next one only after the previous has finished.
+// flushes it and then runs any compactions. That job owns compactFrom, and the writer
+// starts the next one only after the previous has finished.
 //
 // mu guards mem, imm, levels and err, which readers also use. Only the writer changes
-// mem and only the background job changes levels, so each reads its own without the
-// lock. Both hold it only to apply a batch or swap in tables, never across I/O.
+// mem, so it reads mem without the lock. Levels change only through commit, which
+// holds commitMu to serialize manifest updates and guard logNum. Nobody holds mu
+// across I/O.
 //
 // levels[0] holds flushed tables newest first, and their key ranges may overlap.
 // Every deeper level is a sorted run of non-overlapping tables. For any key, a version
@@ -56,6 +57,8 @@ type Store struct {
 	quit      chan struct{}
 	closeOnce sync.Once
 	done      sync.WaitGroup
+
+	commitMu sync.Mutex
 
 	mu     sync.RWMutex
 	mem    map[string]Record
@@ -427,10 +430,11 @@ func (s *Store) flush(imm map[string]Record, walNum uint64) error {
 	if err != nil {
 		return err
 	}
-	levels := slices.Clone(s.levels)
-	levels[0] = append([]*sstable{table}, levels[0]...)
-	s.logNum = walNum + 1
-	if err := s.commit(levels); err != nil {
+	err = s.commit(func(levels [][]*sstable) {
+		levels[0] = append([]*sstable{table}, levels[0]...)
+		s.logNum = walNum + 1
+	})
+	if err != nil {
 		return err
 	}
 	s.mu.Lock()
@@ -439,13 +443,20 @@ func (s *Store) flush(imm map[string]Record, walNum uint64) error {
 	return nil
 }
 
+func (s *Store) version() [][]*sstable {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.levels
+}
+
 func (s *Store) pickCompaction() (int, bool) {
-	if len(s.levels[0]) >= s.opts.CompactionTrigger {
+	levels := s.version()
+	if len(levels[0]) >= s.opts.CompactionTrigger {
 		return 0, true
 	}
 	limit := s.opts.LevelSize
 	for level := 1; level < maxLevels-1; level++ {
-		if levelBytes(s.levels[level]) > limit {
+		if levelBytes(levels[level]) > limit {
 			return level, true
 		}
 		limit *= levelMultiplier
@@ -462,26 +473,26 @@ func levelBytes(tables []*sstable) int64 {
 }
 
 // L0 must be compacted as a whole: its tables overlap, so moving only the newer ones
-// down would leave an older version above them that shadows the newer data.
+// down would leave an older version above them that shadows the newer data. Tables
+// flushed to L0 during the merge are newer than every input, so they stay above it.
 func (s *Store) compactLevel(level int) error {
-	upper := s.levels[0]
+	levels := s.version()
+	upper := levels[0]
 	if level > 0 {
-		upper = []*sstable{s.nextToCompact(level)}
+		upper = []*sstable{s.nextToCompact(level, levels[level])}
 	}
 	lo, hi, err := keyRange(upper)
 	if err != nil {
 		return err
 	}
-	var lower, keep []*sstable
-	for _, t := range s.levels[level+1] {
+	var lower []*sstable
+	for _, t := range levels[level+1] {
 		overlaps, err := overlapsRange(t, lo, hi)
 		if err != nil {
 			return err
 		}
 		if overlaps {
 			lower = append(lower, t)
-		} else {
-			keep = append(keep, t)
 		}
 	}
 	if level > 0 {
@@ -494,7 +505,7 @@ func (s *Store) compactLevel(level int) error {
 		if lo, hi, err = keyRange(inputs); err != nil {
 			return err
 		}
-		bottom, err := s.isBottom(level+1, lo, hi)
+		bottom, err := isBottom(levels[level+2:], lo, hi)
 		if err != nil {
 			return err
 		}
@@ -503,11 +514,13 @@ func (s *Store) compactLevel(level int) error {
 		}
 	}
 
-	levels := slices.Clone(s.levels)
-	levels[level] = slices.DeleteFunc(slices.Clone(levels[level]), func(t *sstable) bool { return slices.Contains(upper, t) })
-	levels[level+1] = slices.Concat(keep, outputs)
-	slices.SortFunc(levels[level+1], func(a, b *sstable) int { return bytes.Compare(a.largest(), b.largest()) })
-	if err := s.commit(levels); err != nil {
+	err = s.commit(func(levels [][]*sstable) {
+		levels[level] = slices.DeleteFunc(slices.Clone(levels[level]), func(t *sstable) bool { return slices.Contains(upper, t) })
+		kept := slices.DeleteFunc(slices.Clone(levels[level+1]), func(t *sstable) bool { return slices.Contains(lower, t) })
+		levels[level+1] = slices.Concat(kept, outputs)
+		slices.SortFunc(levels[level+1], func(a, b *sstable) int { return bytes.Compare(a.largest(), b.largest()) })
+	})
+	if err != nil {
 		return err
 	}
 	for _, t := range slices.Concat(upper, lower) {
@@ -519,8 +532,7 @@ func (s *Store) compactLevel(level int) error {
 	return nil
 }
 
-func (s *Store) nextToCompact(level int) *sstable {
-	tables := s.levels[level]
+func (s *Store) nextToCompact(level int, tables []*sstable) *sstable {
 	for _, t := range tables {
 		if bytes.Compare(t.largest(), s.compactFrom[level]) > 0 {
 			return t
@@ -531,8 +543,8 @@ func (s *Store) nextToCompact(level int) *sstable {
 
 // A tombstone may be dropped only when no deeper level can still hold an older
 // version of its key; otherwise dropping it would resurrect that version.
-func (s *Store) isBottom(level int, lo, hi []byte) (bool, error) {
-	for _, tables := range s.levels[level+1:] {
+func isBottom(deeper [][]*sstable, lo, hi []byte) (bool, error) {
+	for _, tables := range deeper {
 		for _, t := range tables {
 			overlaps, err := overlapsRange(t, lo, hi)
 			if err != nil || overlaps {
@@ -609,7 +621,13 @@ func overlapsRange(t *sstable, lo, hi []byte) (bool, error) {
 	return bytes.Compare(smallest, hi) <= 0 && bytes.Compare(t.largest(), lo) >= 0, nil
 }
 
-func (s *Store) commit(levels [][]*sstable) error {
+// Flush and compaction may run at once, so each applies its change to the levels as
+// they are at commit time, never to a copy taken before its I/O.
+func (s *Store) commit(edit func(levels [][]*sstable)) error {
+	s.commitMu.Lock()
+	defer s.commitMu.Unlock()
+	levels := slices.Clone(s.levels)
+	edit(levels)
 	m := manifest{logNum: s.logNum}
 	for i, tables := range levels {
 		nums := make([]uint64, len(tables))
