@@ -3,6 +3,8 @@ package storage
 import (
 	"bytes"
 	"errors"
+	"fmt"
+	"math/rand/v2"
 	"path/filepath"
 	"slices"
 	"testing"
@@ -105,5 +107,25 @@ func TestCompactionKeepsTombstoneWhileDeeperLevelHoldsKey(t *testing.T) {
 	}
 	if _, err := s.Get([]byte("k")); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("deleted key resurrected from L2: %v", err)
+	}
+}
+
+func TestWritesStopWhileL0IsFull(t *testing.T) {
+	opts := Options{MemtableSize: 1 << 10, CompactionTrigger: 2, LevelSize: 1 << 20}
+	s, err := Open(t.TempDir(), opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	limit := l0StopFactor * opts.CompactionTrigger
+	value := make([]byte, 100)
+	rng := rand.New(rand.NewPCG(1, 2))
+	for range 5000 {
+		if err := s.Put(fmt.Appendf(nil, "k%06d", rng.IntN(100000)), value); err != nil {
+			t.Fatal(err)
+		}
+		if n := len(s.version()[0]); n > limit {
+			t.Fatalf("L0 holds %d tables, writes should have stopped at %d", n, limit)
+		}
 	}
 }
