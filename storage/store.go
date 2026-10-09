@@ -24,6 +24,7 @@ const (
 	defaultLevelSize         = 16 << 20
 	defaultTableSize         = 2 << 20
 	levelMultiplier          = 10
+	l0StopFactor             = 3
 )
 
 // CompactionTrigger is the number of L0 tables that starts an L0 compaction.
@@ -38,8 +39,9 @@ type Options struct {
 
 // The writer goroutine owns wal, walNum, memSize, batches, userBytes and flushed. When
 // the memtable fills, the writer moves it to imm and starts a background job that
-// flushes it and then runs any compactions. That job owns compactFrom, and the writer
-// starts the next one only after the previous has finished.
+// flushes it, and it starts the next one only after the previous has finished. Each
+// flush wakes the compactor goroutine, which owns compactFrom. Writes stop while L0
+// holds l0StopFactor times the compaction trigger, so L0 can't outgrow compaction.
 //
 // mu guards mem, imm, levels and err, which readers also use. Only the writer changes
 // mem, so it reads mem without the lock. Levels change only through commit, which
@@ -57,6 +59,11 @@ type Store struct {
 	quit      chan struct{}
 	closeOnce sync.Once
 	done      sync.WaitGroup
+
+	compactWake    chan struct{}
+	compacted      chan struct{}
+	stopCompaction chan struct{}
+	compactor      sync.WaitGroup
 
 	commitMu sync.Mutex
 
@@ -112,6 +119,10 @@ func Open(dir string, opts Options) (*Store, error) {
 		writes: make(chan writeReq),
 		quit:   make(chan struct{}),
 		mem:    map[string]Record{},
+
+		compactWake:    make(chan struct{}, 1),
+		compacted:      make(chan struct{}, 1),
+		stopCompaction: make(chan struct{}),
 	}
 	if err := s.recover(ssts, wals); err != nil {
 		s.Close()
@@ -119,6 +130,8 @@ func Open(dir string, opts Options) (*Store, error) {
 	}
 	s.done.Add(1)
 	go s.writeLoop()
+	s.compactor.Add(1)
+	go s.compactLoop()
 	return s, nil
 }
 
@@ -276,8 +289,12 @@ func (s *Store) Delete(key []byte) error {
 }
 
 func (s *Store) Close() error {
-	s.closeOnce.Do(func() { close(s.quit) })
-	s.done.Wait()
+	s.closeOnce.Do(func() {
+		close(s.quit)
+		s.done.Wait()
+		close(s.stopCompaction)
+	})
+	s.compactor.Wait()
 	var errs []error
 	if s.wal != nil {
 		errs = append(errs, s.wal.Close())
@@ -375,9 +392,15 @@ func (s *Store) fail(err error) error {
 func (s *Store) rotate() error {
 	if s.flushed != nil {
 		<-s.flushed
+	}
+	for {
 		if err := s.failure(); err != nil {
 			return err
 		}
+		if len(s.version()[0]) < l0StopFactor*s.opts.CompactionTrigger {
+			break
+		}
+		<-s.compacted
 	}
 	oldWAL, oldNum := s.wal, s.walNum
 	if err := s.openNewWAL(); err != nil {
@@ -394,28 +417,48 @@ func (s *Store) rotate() error {
 	go func() {
 		defer s.done.Done()
 		defer close(done)
-		if err := s.flushAndCompact(imm, oldWAL, oldNum); err != nil {
+		err := s.flush(imm, oldNum)
+		oldWAL.Close()
+		if err != nil {
 			s.fail(err)
+			return
 		}
+		os.Remove(s.path(oldNum, "wal"))
+		notify(s.compactWake)
 	}()
 	return nil
 }
 
-func (s *Store) flushAndCompact(imm map[string]Record, wal *WAL, walNum uint64) error {
-	err := s.flush(imm, walNum)
-	wal.Close()
-	if err != nil {
-		return err
+func notify(c chan struct{}) {
+	select {
+	case c <- struct{}{}:
+	default:
 	}
-	os.Remove(s.path(walNum, "wal"))
+}
+
+func (s *Store) compactLoop() {
+	defer s.compactor.Done()
 	for {
+		select {
+		case <-s.compactWake:
+			s.compactAll()
+		case <-s.stopCompaction:
+			s.compactAll()
+			return
+		}
+	}
+}
+
+func (s *Store) compactAll() {
+	for s.failure() == nil {
 		level, ok := s.pickCompaction()
 		if !ok {
-			return nil
+			return
 		}
 		if err := s.compactLevel(level); err != nil {
-			return err
+			s.fail(err)
 		}
+		notify(s.compacted)
 	}
 }
 
