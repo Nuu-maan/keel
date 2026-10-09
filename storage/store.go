@@ -493,19 +493,23 @@ func (s *Store) version() [][]*sstable {
 	return s.levels
 }
 
+// Picks the level furthest past its limit. Always preferring L0 would starve deeper
+// levels while writes keep flushing, and each L0 compaction would then rewrite an
+// ever larger L1.
 func (s *Store) pickCompaction() (int, bool) {
 	levels := s.version()
-	if len(levels[0]) >= s.opts.CompactionTrigger {
-		return 0, true
+	best, bestScore := -1, 1.0
+	if n := len(levels[0]); n >= s.opts.CompactionTrigger {
+		best, bestScore = 0, float64(n)/float64(s.opts.CompactionTrigger)
 	}
 	limit := s.opts.LevelSize
 	for level := 1; level < maxLevels-1; level++ {
-		if levelBytes(levels[level]) > limit {
-			return level, true
+		if score := float64(levelBytes(levels[level])) / float64(limit); score > bestScore {
+			best, bestScore = level, score
 		}
 		limit *= levelMultiplier
 	}
-	return 0, false
+	return best, best >= 0
 }
 
 func levelBytes(tables []*sstable) int64 {

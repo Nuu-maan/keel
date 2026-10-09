@@ -169,3 +169,22 @@ func TestOpenCompactsFullL0(t *testing.T) {
 	}
 	s.Close()
 }
+
+func TestDeeperLevelsKeepUpWithSteadyWrites(t *testing.T) {
+	opts := Options{MemtableSize: 1 << 10, CompactionTrigger: 2, LevelSize: 16 << 10, TableSize: 4 << 10}
+	s, err := Open(t.TempDir(), opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	value := make([]byte, 100)
+	rng := rand.New(rand.NewPCG(1, 2))
+	for range 10000 {
+		if err := s.Put(fmt.Appendf(nil, "k%06d", rng.IntN(100000)), value); err != nil {
+			t.Fatal(err)
+		}
+		if n := levelBytes(s.version()[1]); n > 10*opts.LevelSize {
+			t.Fatalf("L1 holds %d bytes against a limit of %d: L0 compactions starve it", n, opts.LevelSize)
+		}
+	}
+}
